@@ -1,22 +1,46 @@
-# Autopilot Governor (+ Prefix-Cache Pilot inside)
+# InferenceMonitor — an autopilot for your AI engine
 
-An agent that owns its inference: it watches its own vLLM engine's telemetry,
-classifies pressure with deterministic rules, actuates without restarts first,
-and can restart its own Deployment as the closer. The model never makes
-operational decisions -- Python does; the model only narrates.
+## What it is
 
-## Layout
+When you run an AI model yourself instead of calling someone else's API, you own a new problem: traffic spikes. A surge of users can overwhelm the engine — answers slow to a crawl, requests pile up, things start failing. Most teams handle this with static settings and hope, or by paying for hardware that sits idle "just in case."
 
-- `governor.py` -- control loop + live dashboard (:8081) + optional proxy (:8082)
-- `cachepilot.py` -- standalone prefix-cache A/B demo (also a dashboard button)
-- `loadgen.py` -- flood script to create demo pressure
-- `demo-script.md` -- the 60-second demo narration
+InferenceMonitor is a small watchdog program that sits next to your AI engine, checks its vital signs every two seconds, and automatically protects it when demand surges. Think of it as a thermostat for AI: when things heat up, it eases off gracefully instead of melting down — then returns to full quality when the surge passes. No one gets paged at 3am.
 
-## Quickstart (on your Mac)
+## What it does
 
-Prereqs: the `kubectl port-forward` to the workshop cluster running
-(`KUBECONFIG=~/MidwestProject/s01.yaml kubectl port-forward svc/vllm 8000:8000`),
-and Python 3.
+- **Watches the engine's health** — memory pressure, waiting requests, answer speed, and how often repeated work gets reused from cache.
+- **Decides, using simple fixed rules,** whether the engine is OK, under pressure, or recovering. Three bad readings in a row means pressure; five good ones means recovery. No guesswork.
+- **Sheds load without restarting** — under pressure it automatically shortens answers and trims stale conversation history, so the engine does less work per request and drains the backlog.
+- **Restarts itself as a last resort** — only if you explicitly allow it, it can restart its own deployment when gentler measures aren't enough.
+- **Explains itself out loud** — every decision is narrated in one plain-English sentence by the AI model itself, shown in the live dashboard log.
+- **Simulates traffic surges** — the dashboard has Low / Medium / High demand buttons (or a full sequence that runs all three back-to-back). Pick one, watch the governor react in real time, and get an automatic report card when it finishes: peak memory, peak queue, how many times pressure tripped, and concrete suggestions for next time.
+- **Tests a real cost saver** — the bundled Prefix-Cache Pilot measures whether rewording prompts (putting the repeated document before the question) makes first answers arrive faster by reusing cached computation instead of redoing it.
+
+## The one design rule that matters
+
+The AI model never makes operational decisions. Boring, predictable Python code makes every call — the model only narrates what was decided, for the audience. That's what makes the system trustworthy: you can read the rules, and the rules don't improvise.
+
+## Tech stack
+
+- **Python 3** — the whole app. The dashboard is plain HTML and JavaScript served directly by the program; no web framework.
+- **vLLM** — the open-source engine that actually runs the AI model and serves answers.
+- **Qwen3-4B** — the open AI model used both for answering users and for narrating the governor's decisions.
+- **Kubernetes** — where the engine lives; the watchdog talks to it when the restart option is enabled.
+- **requests** — the single outside Python library, used for plain HTTP calls.
+
+That's it. No database, no build step, no frontend toolchain.
+
+## What's in the box
+
+- `governor.py` — the watchdog: control loop, live dashboard (`:8081`), and request-shaping proxy (`:8082`)
+- `cachepilot.py` — the prefix-cache experiment (also runs from a dashboard button)
+- `loadgen.py` — a standalone script for generating load from the terminal
+- `demo-script.md` — the 60-second guided demo
+- `requirements.txt` — just `requests`
+
+## Run it
+
+You need a vLLM engine reachable at `http://localhost:8000` (in the workshop this is a `kubectl port-forward` to the cluster) and Python 3:
 
 ```
 cd ~/MidwestProject/autopilot
@@ -25,53 +49,20 @@ python3 -m py_compile governor.py cachepilot.py loadgen.py && echo SYNTAX-OK
 python3 governor.py
 ```
 
-Open http://localhost:8081 -- the dashboard. It shows engine state, KV cache,
-queue, TTFT, tokens/s, prefix-cache hit rate, and the decision log.
+Open http://localhost:8081 for the dashboard. Press **High demand**, watch the state flip to PRESSURE and the governor narrate itself, then read the report card when the simulation ends.
 
-With the restart closer enabled:
+To let the governor restart its own engine as a last resort:
 
 ```
 python3 governor.py --allow-restart
 ```
 
-This lets the governor run `kubectl rollout restart deployment/vllm -n workshop-s12`
-using `~/MidwestProject/s01.yaml` when terse mode isn't enough. Test that your
-token can do it first: `KUBECONFIG=~/MidwestProject/s01.yaml kubectl -n workshop-s12 auth can-i rollout/restart deployment`.
+## Demo
 
-## The pieces
+See `demo-script.md` for the 60-second version: calm, surge, response, recovery.
 
-**Control loop** (every 2s): scrape `/metrics` -> resolve metric names across
-vLLM versions -> compute pressure (KV >= 85% or queue >= 4, 3 samples to enter,
-5 healthy samples to exit) -> actuate.
+## If something looks wrong
 
-**Actuators, in order:**
-1. Terse mode (no restart): via the proxy (:8082), answers get a 3-sentence
-   system instruction, max_tokens capped at 128, stale history compacted.
-   Point Open WebUI at `http://localhost:8082/v1` to route chat through it
-   (non-streaming in this version).
-2. Librarian compaction: same proxy path, history truncated with a note.
-3. Prefix-Cache Pilot: dashboard button runs the A/B (question-first vs
-document-first layouts) and prints TTFT + cache-counter deltas.
-4. Restart closer (opt-in): `kubectl rollout restart` on your own Deployment,
-   then a cooldown while it re-reads metrics.
-
-**Narration:** every decision is explained in one sentence by Qwen3-4B itself,
-shown in the dashboard log. If the model call fails, the action still happens
-and is logged -- narration never blocks control.
-
-## Demo in 60 seconds
-
-See `demo-script.md`.
-
-## Troubleshooting
-
-- Dashboard shows "metrics error": the port-forward window closed. Restart it.
-- Tiles show "-": your vLLM version uses different metric names. The dashboard's
-  `/api/status` JSON lists every name it found under `latest.found` -- compare
-  with `curl localhost:8000/metrics | grep ^vllm:` and extend
-  `METRIC_CANDIDATES` in `governor.py`.
-- CachePilot says "no prefix-cache counters": prefix caching may be off in the
-  workshop Deployment. The TTFT comparison still runs; treat it as the honest
-  result.
-- `kubectl rollout restart` forbidden: your student token lacks RBAC. Demo the
-diagnosis + terse-mode beats only -- still a complete story.
+- Dashboard says "metrics error": the port-forward to the engine closed. Restart it.
+- A tile shows "-": your vLLM version names its metrics differently. Open `/api/status` on the dashboard port — it lists every metric name it found — and add the missing names to `METRIC_CANDIDATES` in `governor.py`.
+- CachePilot reports no cache counters: prefix caching may be switched off where your engine runs. The speed comparison still runs; treat its verdict as the honest result.

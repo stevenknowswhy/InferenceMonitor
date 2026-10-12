@@ -7,8 +7,8 @@ Sidecar control loop for a self-hosted vLLM engine:
      (The 4B model never makes operational decisions -- Python does.
      The model only narrates.)
   3. Actuates without restarts first:
-       - terse mode (shorter answers, capped max_tokens) via the proxy
-       - librarian compaction (truncate stale history) via the proxy
+       - terse mode (shorter answers, capped max_tokens, thinking off) via the proxy
+       - librarian compaction (summarize stale history, then check the facts) via the proxy
        - Prefix-Cache Pilot (restructure prompts for cache reuse)
      ...then kubectl rollout restart as the closer (opt-in: --allow-restart).
   4. Narrates every decision through the model itself.
@@ -55,6 +55,9 @@ QUEUE_PRESSURE = 4
 ENTER_AFTER = 3
 EXIT_AFTER = 5
 RECOVERY_COOLDOWN = 90
+TERSE_WINDOW = 25
+WINDOW_SECS = 30.0
+COMPARE_SECONDS = 20
 # Scheduler slots on this deployment (--max-num-seqs). Used only for the
 # live safety lamp, so medium demand can show Warning before the engine
 # actually crosses the protection line.
@@ -76,7 +79,52 @@ METRIC_CANDIDATES = {
     "prefix_hits":    ["vllm:gpu_prefix_cache_hits_total", "vllm:prefix_cache_hits_total"],
     "prefix_queries": ["vllm:gpu_prefix_cache_queries_total", "vllm:prefix_cache_queries_total"],
     "prefix_rate":    ["vllm:gpu_prefix_cache_hit_rate"],
+    "queue_sum":      ["vllm:request_queue_time_seconds_sum"],
+    "queue_cnt":      ["vllm:request_queue_time_seconds_count"],
+    "prefill_sum":    ["vllm:request_prefill_time_seconds_sum"],
+    "prefill_cnt":    ["vllm:request_prefill_time_seconds_count"],
+    "decode_sum":     ["vllm:request_decode_time_seconds_sum"],
+    "decode_cnt":     ["vllm:request_decode_time_seconds_count"],
+    "preemptions":    ["vllm:num_preemptions_total"],
 }
+
+FACT_RE = re.compile(r"\$[\d,]+(?:\.\d+)?|\b\d{4}\b|\b\d+(?:\.\d+)?%?")
+
+
+def restart_ready(allow, used, now, pressure_since, cooldown_until, under_pressure):
+    """Restart only after terse mode has had a real window and pressure is still there."""
+    return bool(
+        allow and not used and under_pressure and pressure_since
+        and now >= pressure_since + TERSE_WINDOW
+        and now >= cooldown_until
+    )
+
+
+def classify_bottleneck(waiting, kv, queue_avg, prefill_avg, decode_avg, preemptions_delta):
+    """Name the limiter from the signals this vLLM build actually publishes."""
+    if waiting >= QUEUE_PRESSURE or (
+        waiting > 0 and isinstance(queue_avg, float) and queue_avg >= 0.5
+    ):
+        return "queue-bound"
+    if kv >= KV_PRESSURE or (preemptions_delta or 0) > 0:
+        return "KV-bound"
+    if isinstance(prefill_avg, float) and isinstance(decode_avg, float):
+        if prefill_avg > decode_avg * 1.5 and prefill_avg >= 0.05:
+            return "prefill-bound"
+        if decode_avg > prefill_avg * 1.5 and decode_avg >= 0.05:
+            return "decode-bound"
+    return "clear"
+
+
+def retained_facts(text, summary):
+    """Numbers and dates from dropped turns, and how many the summary still contains."""
+    facts = []
+    for fact in FACT_RE.findall(text or ""):
+        if fact not in facts:
+            facts.append(fact)
+    facts = facts[:12]
+    kept = sum(1 for fact in facts if fact in (summary or ""))
+    return facts, kept
 
 
 # ----------------------------------------------------------------------------
@@ -86,8 +134,7 @@ class MetricsScraper:
     def __init__(self, base):
         self.base = base.rstrip("/")
         self.resolved = {}
-        self._prev = {}
-        self._prev_t = None
+        self._hist = []
 
     @staticmethod
     def _parse(text):
@@ -124,27 +171,53 @@ class MetricsScraper:
         snap["running"] = get("running")
         kv = get("kv")
         snap["kv"] = kv / 100.0 if kv > 1.5 else kv
-        s, c = get("ttft_sum"), get("ttft_cnt")
-        snap["ttft_avg"] = None
-        if self._prev and c > self._prev.get("ttft_cnt", 0):
-            dc = c - self._prev["ttft_cnt"]
-            if dc > 0:
-                snap["ttft_avg"] = (s - self._prev.get("ttft_sum", s)) / dc
-        dt = now - self._prev_t if self._prev_t else 0
+        point = {
+            "ts": now,
+            "ttft_sum": get("ttft_sum"), "ttft_cnt": get("ttft_cnt"),
+            "queue_sum": get("queue_sum"), "queue_cnt": get("queue_cnt"),
+            "prefill_sum": get("prefill_sum"), "prefill_cnt": get("prefill_cnt"),
+            "decode_sum": get("decode_sum"), "decode_cnt": get("decode_cnt"),
+            "hits": get("prefix_hits"), "queries": get("prefix_queries"),
+            "preemptions": get("preemptions"),
+            "prompt_tok": get("prompt_tok"), "gen_tok": get("gen_tok"),
+        }
+        prev = self._hist[-1] if self._hist else None
+        self._hist.append(point)
+        cutoff = now - WINDOW_SECS
+        while len(self._hist) > 2 and self._hist[0]["ts"] < cutoff:
+            self._hist.pop(0)
+        old = self._hist[0] if len(self._hist) > 1 else None
+
+        def avg(sum_k, cnt_k):
+            if not old or point["ts"] <= old["ts"]:
+                return None
+            dc = point[cnt_k] - old[cnt_k]
+            ds = point[sum_k] - old[sum_k]
+            if dc > 0 and ds >= 0:
+                return ds / dc
+            return None
+
+        snap["ttft_avg"] = avg("ttft_sum", "ttft_cnt")
+        snap["queue_avg"] = avg("queue_sum", "queue_cnt")
+        snap["prefill_avg"] = avg("prefill_sum", "prefill_cnt")
+        snap["decode_avg"] = avg("decode_sum", "decode_cnt")
         snap["tok_per_s"] = None
-        if dt > 0 and self._prev:
-            d = (get("prompt_tok") + get("gen_tok")
-                 - self._prev.get("prompt_tok", 0) - self._prev.get("gen_tok", 0))
+        if prev and now > prev["ts"]:
+            d = (point["prompt_tok"] + point["gen_tok"]
+                 - prev["prompt_tok"] - prev["gen_tok"])
             if d >= 0:
-                snap["tok_per_s"] = d / dt
-        if self.resolved.get("prefix_rate"):
-            snap["prefix_hit_rate"] = get("prefix_rate")
-        else:
-            h, q = get("prefix_hits"), get("prefix_queries")
-            snap["prefix_hit_rate"] = (h / q) if q > 0 else None
-        self._prev = {"ttft_sum": s, "ttft_cnt": c,
-                      "prompt_tok": get("prompt_tok"), "gen_tok": get("gen_tok")}
-        self._prev_t = now
+                snap["tok_per_s"] = d / (now - prev["ts"])
+        snap["prefix_hit_rate"] = None
+        if old and point["queries"] > old["queries"]:
+            dh = point["hits"] - old["hits"]
+            dq = point["queries"] - old["queries"]
+            if dq > 0 and dh >= 0:
+                snap["prefix_hit_rate"] = dh / dq
+        snap["preemptions_delta"] = (
+            max(0.0, point["preemptions"] - old["preemptions"]) if old else 0.0)
+        snap["bottleneck"] = classify_bottleneck(
+            snap["waiting"], snap["kv"], snap["queue_avg"],
+            snap["prefill_avg"], snap["decode_avg"], snap["preemptions_delta"])
         return snap
 
 
@@ -244,7 +317,13 @@ class Governor:
         self.pressure_streak = 0
         self.healthy_streak = 0
         self.cooldown_until = 0
+        self.pressure_since = 0
         self.restart_used = False
+        self.governed = True
+        self.proxy_base = "http://127.0.0.1:8082"
+        self.compare_running = False
+        self.last_compare = None
+        self.last_compaction = None
         self.policy = {"terse": False}
         self.log = []
         self.activity = []
@@ -280,6 +359,7 @@ class Governor:
         print(f"[{entry['t']}] {action}: {detail}", flush=True)
         if say:
             print(f"   says: {say}", flush=True)
+        return entry
 
     def _activity(self, msg):
         with self.lock:
@@ -291,13 +371,23 @@ class Governor:
                   f"In ONE sentence for a live demo audience, explain this: {trigger} "
                   f"So you decided: {action}. Be concrete and confident.")
         try:
-            r = requests.post(VLLM_BASE + "/v1/chat/completions", timeout=30, json={
+            r = requests.post(VLLM_BASE + "/v1/chat/completions", timeout=20, json={
                 "model": MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 80, "temperature": 0.3})
+                "max_tokens": 60, "temperature": 0.3,
+                "chat_template_kwargs": {"enable_thinking": False}})
             return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
+        except Exception:
             return f"(narrator offline) {action}."
+
+    def _narrate_async(self, entry, trigger, action):
+        """Narration never blocks the control loop."""
+        def run():
+            say = self.narrate(trigger, action)
+            entry["say"] = say
+            if say:
+                print(f"   says: {say}", flush=True)
+        threading.Thread(target=run, daemon=True).start()
 
     def tick(self):
         try:
@@ -317,9 +407,12 @@ class Governor:
             fs["peak_kv"] = max(fs["peak_kv"], kv * 100)
             fs["peak_queue"] = max(fs["peak_queue"], waiting)
             fs["peak_running"] = max(fs["peak_running"], snap.get("running") or 0)
-            ts = snap.get("tok_per_s")
-            if isinstance(ts, (int, float)):
-                fs["tok_s_samples"].append(ts)
+            for key, dest in (("tok_per_s", "tok_s_samples"),
+                               ("ttft_avg", "ttft_samples"),
+                               ("queue_avg", "queue_samples")):
+                val = snap.get(key)
+                if isinstance(val, (int, float)):
+                    fs.setdefault(dest, []).append(val)
             if self.state == "PRESSURE":
                 fs["pressure_seconds"] += POLL_SECS
         pressure = kv >= KV_PRESSURE or waiting >= QUEUE_PRESSURE
@@ -336,8 +429,8 @@ class Governor:
         elif self.state == "PRESSURE":
             if pressure:
                 self.healthy_streak = 0
-                if (self.allow_restart and not self.restart_used
-                        and now >= self.cooldown_until):
+                if restart_ready(self.allow_restart, self.restart_used, now,
+                                 self.pressure_since, self.cooldown_until, True):
                     self._do_restart(snap)
             else:
                 self.healthy_streak += 1
@@ -385,34 +478,49 @@ class Governor:
             if not self.policy["terse"]:
                 self.flood_stats["terse_activations"] += 1
         self.policy["terse"] = True
+        self.pressure_since = time.time()
         detail = (f"KV {snap['kv']*100:.0f}% (thresh {KV_PRESSURE*100:.0f}), "
                   f"queue {snap['waiting']:.0f} (thresh {QUEUE_PRESSURE}). "
-                  "Engaging TERSE mode: short answers, capped tokens, no restart yet.")
-        say = self.narrate(
+                  "Engaging TERSE mode: short answers, 128 token cap, thinking off. "
+                  f"Restart stays armed for {TERSE_WINDOW:.0f}s.")
+        entry = self._log("ENTER_PRESSURE", detail)
+        self._narrate_async(
+            entry,
             f"engine pressure: KV cache {snap['kv']*100:.0f}%, {snap['waiting']:.0f} requests waiting",
-            "I'm switching to terse mode -- shorter answers, capped tokens -- to protect latency. No restart yet.")
-        self._log("ENTER_PRESSURE", detail, say)
+            "I'm switching to terse mode -- shorter answers, capped tokens, thinking off -- "
+            "to protect latency. No restart yet.")
 
     def _exit_pressure(self, snap):
         self.state = "NORMAL"
         self.policy["terse"] = False
+        self.restart_used = False
+        self.pressure_since = 0
         ttft = snap.get("ttft_avg")
         detail = (f"Pressure cleared (KV {snap['kv']*100:.0f}%, queue {snap['waiting']:.0f}). "
-                  "Terse mode off." + (f" TTFT avg {ttft:.2f}s." if ttft else ""))
-        say = self.narrate("engine pressure cleared",
-                           "Standing down -- full answers restored. The intervention worked.")
-        self._log("RECOVERED", detail, say)
+                  "Terse mode off. Full answers restored."
+                  + (f" TTFT 30s avg {ttft:.2f}s." if ttft else ""))
+        entry = self._log("RECOVERED", detail)
+        self._narrate_async(entry, "engine pressure cleared",
+                            "Standing down -- full answers restored. The intervention worked.")
 
     def _do_restart(self, snap):
         self.restart_used = True
         self.state = "RECOVERY"
         self.cooldown_until = time.time() + RECOVERY_COOLDOWN
-        self._log("RESTART", "Pressure sustained -- restarting my own deployment (the closer).")
-        ok, out = self._kubectl_restart()
-        say = self.narrate(
+        entry = self._log(
+            "RESTART",
+            f"Terse mode held for {TERSE_WINDOW:.0f}s and pressure is still high. "
+            "Restarting the deployment off the control loop.")
+        self._narrate_async(
+            entry,
             f"terse mode wasn't enough (KV {snap['kv']*100:.0f}%)",
-            "I'm restarting my own engine now -- back in about a minute. This is what owning your inference means.")
-        self._log("RESTART_DONE" if ok else "RESTART_FAILED", out[-300:], say)
+            "I'm restarting my own engine now -- back in about a minute. "
+            "This is what owning your inference means.")
+        threading.Thread(target=self._restart_thread, daemon=True).start()
+
+    def _restart_thread(self):
+        ok, out = self._kubectl_restart()
+        self._log("RESTART_DONE" if ok else "RESTART_FAILED", out[-300:])
 
     def _kubectl_restart(self):
         cmd = ["kubectl", "--kubeconfig", KUBECONFIG, "-n", NAMESPACE,
@@ -435,9 +543,11 @@ class Governor:
 # ----------------------------------------------------------------------------
 FLOOD_PRESETS = {
     # preset: (workers, max_tokens, duration_seconds)
-    "low": (4, 150, 30),      # gentle, should stay NORMAL
-    "medium": (10, 300, 45),  # moderate -- may flirt with pressure
-    "high": (18, 600, 60),    # heavy -- should trigger PRESSURE
+    # High sits 4 above --max-num-seqs so the engine queue can cross 4 and
+    # PRESSURE is reachable on this GPU. KV cache alone never fills here.
+    "low": (4, 150, 30),
+    "medium": (10, 300, 45),
+    "high": (MAX_NUM_SEQS + 4, 320, 40),
 }
 FLOOD_PROMPTS = [
     "Write a detailed 400-word essay on the history of container orchestration, covering Borg, Omega, Kubernetes, and Nomad with dates and key design decisions.",
@@ -447,51 +557,111 @@ FLOOD_PROMPTS = [
 ]
 
 
-def _flood_hit(gov, prompt, wave, wid, max_tokens):
+def fresh_stats(preset, workers, mtok, dur, governed):
+    return {
+        "preset": preset, "workers": workers, "max_tokens": mtok, "duration": dur,
+        "governed": bool(governed), "started": time.time(),
+        "requests": 0, "errors": 0, "waves": 0, "finished": 0,
+        "peak_kv": 0.0, "peak_queue": 0, "peak_running": 0,
+        "pressure_entries": 0, "pressure_seconds": 0,
+        "terse_activations": 0, "tok_s_samples": [],
+        "ttft_samples": [], "queue_samples": [], "latency_samples": [],
+    }
+
+
+def _mean(xs):
+    xs = [x for x in xs if isinstance(x, (int, float))]
+    return round(sum(xs) / len(xs), 2) if xs else None
+
+
+def _flood_hit(gov, prompt, n, max_tokens):
     t0 = time.time()
+    ok = False
     try:
-        r = requests.post(VLLM_BASE + "/v1/chat/completions", timeout=180, json={
+        base = gov.proxy_base if gov.governed else VLLM_BASE
+        r = requests.post(base + "/v1/chat/completions", timeout=180, json={
             "model": MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens, "temperature": 0.7})
-        gov._activity(f"wave {wave} worker {wid}: HTTP {r.status_code} in {time.time()-t0:.1f}s")
-        with gov.lock:
-            if gov.flood_stats:
-                gov.flood_stats["requests"] += 1
+        ok = r.status_code < 400
+        err = "" if ok else f"HTTP {r.status_code}"
     except Exception as e:
-        gov._activity(f"wave {wave} worker {wid}: ERROR {str(e)[:70]}")
-        with gov.lock:
-            if gov.flood_stats:
-                gov.flood_stats["errors"] += 1
+        err = str(e)[:70]
+    elapsed = time.time() - t0
+    with gov.lock:
+        fs = gov.flood_stats
+        if not fs:
+            return
+        fs["finished"] = fs.get("finished", 0) + 1
+        if ok:
+            fs["requests"] += 1
+            fs["latency_samples"].append(elapsed)
+        else:
+            fs["errors"] += 1
+        finished = fs["finished"]
+    if finished == 1 or finished % 8 == 0:
+        route = "proxy" if gov.governed else "direct"
+        tail = f" ({err})" if err else f" last {elapsed:.1f}s"
+        gov._activity(f"{finished} finished via {route}{tail}")
 
 
 def flood_worker(gov, workers, max_tokens, duration):
+    """Keep `workers` requests in flight until the deadline.
+
+    New requests start as old ones finish, so once terse mode flips, the
+    next governed request is already capped. A join-the-whole-wave loop
+    would spend the flood on the uncapped first batch.
+    """
     deadline = time.time() + duration
-    wave = 0
+    token = object()
+    slot = {"n": 0, "inflight": 0, "token": token}
+    slock = threading.Lock()
+
+    def refill():
+        while gov.flood_on and time.time() < deadline:
+            with slock:
+                if slot["token"] is not token or slot["inflight"] >= workers:
+                    return
+                slot["inflight"] += 1
+                slot["n"] += 1
+                n = slot["n"]
+            with gov.lock:
+                if gov.flood_stats:
+                    gov.flood_stats["waves"] = n
+            prompt = FLOOD_PROMPTS[n % len(FLOOD_PROMPTS)]
+
+            def run(n=n, prompt=prompt):
+                try:
+                    _flood_hit(gov, prompt, n, max_tokens)
+                finally:
+                    with slock:
+                        slot["inflight"] -= 1
+                        alive = slot["token"] is token
+                    if alive and gov.flood_on and time.time() < deadline:
+                        refill()
+
+            threading.Thread(target=run, daemon=True).start()
+
+    route = "governor proxy" if gov.governed else "engine directly"
+    gov._activity(f"keeping {workers} requests in flight via the {route}")
+    refill()
     while gov.flood_on and time.time() < deadline:
-        wave += 1
-        gov._activity(f"flood wave {wave}: launching {workers} concurrent requests")
-        with gov.lock:
-            if gov.flood_stats:
-                gov.flood_stats["waves"] = wave
-        threads = []
-        for k in range(workers):
-            t = threading.Thread(
-                target=_flood_hit,
-                args=(gov, FLOOD_PROMPTS[(wave + k) % len(FLOOD_PROMPTS)], wave, k, max_tokens),
-                daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join(timeout=150)
-        time.sleep(1)
-    if gov.flood_on:
-        # simulation time expired -- auto-stop
+        time.sleep(0.4)
+    timed_out = gov.flood_on
+    with slock:
+        slot["token"] = None
+    if timed_out:
         gov.flood_on = False
-        if gov.sequence_running:
-            gov._activity(f"sequence {gov.flood_preset}: finished")
+        wait_until = time.time() + 8
+        while time.time() < wait_until:
+            with slock:
+                if slot["inflight"] == 0:
+                    break
+            time.sleep(0.2)
+        if gov.sequence_running or gov.compare_running:
+            gov._activity(f"{gov.flood_preset} run finished")
         else:
-            gov._activity("flood finished: simulation time expired -- generating report")
+            gov._activity("flood finished -- generating report")
             build_flood_summary(gov)
 
 
@@ -504,39 +674,43 @@ def build_flood_summary(gov, quiet=False):
     dur = time.time() - fs["started"]
     samples = fs["tok_s_samples"]
     avg_ts = round(sum(samples) / len(samples), 1) if samples else None
+    lats = fs.get("latency_samples") or []
+    avg_lat = _mean(lats)
+    avg_ttft = _mean(fs.get("ttft_samples") or [])
+    avg_queue = _mean(fs.get("queue_samples") or [])
     sugg = []
+    routed = "through the governor proxy" if fs.get("governed") else "direct to the engine"
     if fs["pressure_entries"] == 0:
         sugg.append(
             f"PRESSURE never triggered on '{fs['preset']}' demand "
-            f"(peak KV {fs['peak_kv']:.0f}%, queue {round(fs['peak_queue'])}). The engine has "
-            "headroom at this load -- step up a preset or lower the pressure thresholds "
-            "if you want to exercise the governor's response.")
+            f"(peak KV {fs['peak_kv']:.0f}%, queue {round(fs['peak_queue'])}, {routed}). "
+            "High demand is the preset sized past this engine's 32 in-flight slots.")
     else:
         sugg.append(
             f"Governor entered PRESSURE {fs['pressure_entries']}x for ~{fs['pressure_seconds']}s "
             f"and engaged terse mode {fs['terse_activations']}x. Peak KV {fs['peak_kv']:.0f}%, "
-            f"queue {round(fs['peak_queue'])}.") 
+            f"queue {round(fs['peak_queue'])}. Route: {routed}.")
         if fs["peak_kv"] >= 95:
-            sugg.append("KV cache nearly saturated -- in production this is where requests start "
-                        "failing outright. Consider shedding load earlier (lower the KV threshold) "
-                        "or adding capacity.")
+            sugg.append("KV cache nearly saturated. This is where requests start failing outright.")
         if fs["pressure_seconds"] > 120:
-            sugg.append("Recovery was slow -- check whether terse mode is draining the queue fast "
-                        "enough, or whether the exit thresholds are too strict.")
+            sugg.append("Recovery was slow. Check whether terse mode is draining the queue.")
     if fs["errors"]:
-        sugg.append(f"{fs['errors']} requests errored -- the engine was over-saturated, not just slow. "
-                    "Earlier intervention would have helped.")
-    if avg_ts is not None and avg_ts < 50 and fs["requests"] > 0:
-        sugg.append("Throughput collapsed during the flood -- routing interactive users through "
-                    "the :8082 proxy lets terse mode protect them while the surge passes.")
-    sugg.append("Note: the flood hits the engine directly (like real external traffic), so terse "
-                "mode shapes only clients routed through the governor proxy on :8082.")
+        sugg.append(f"{fs['errors']} requests errored. The engine was over-saturated, not just slow.")
+    if fs.get("governed"):
+        sugg.append("Governed requests after PRESSURE are capped at 128 tokens with thinking off, "
+                    "so later arrivals finish sooner while the flood is still running.")
+    else:
+        sugg.append("This run bypassed the proxy, so terse mode did not shape these requests.")
     summary = {
         "preset": fs["preset"], "duration_s": round(dur),
+        "governed": bool(fs.get("governed")),
         "requests": fs["requests"], "errors": fs["errors"], "waves": fs["waves"],
         "peak_kv": round(fs["peak_kv"]), "peak_queue": round(fs["peak_queue"]),
         "peak_running": fs["peak_running"],
         "avg_tok_s": avg_ts if avg_ts is not None else "n/a",
+        "avg_latency": avg_lat if avg_lat is not None else "n/a",
+        "avg_ttft": avg_ttft if avg_ttft is not None else "n/a",
+        "avg_queue": avg_queue if avg_queue is not None else "n/a",
         "pressure_entries": fs["pressure_entries"],
         "pressure_seconds": fs["pressure_seconds"],
         "terse_activations": fs["terse_activations"],
@@ -545,13 +719,16 @@ def build_flood_summary(gov, quiet=False):
     if not quiet:
         gov.last_summary = summary
         gov._activity("flood report ready -- see Flood report panel")
-        say = gov.narrate(
-            "flood report",
-            f"Preset {fs['preset']}: {fs['requests']} requests in {dur:.0f}s, peak KV "
-            f"{fs['peak_kv']:.0f}%, queue {round(fs['peak_queue'])}, "
-            f"pressure entries {fs['pressure_entries']}. " + " ".join(sugg[:2]))
-        if say:
-            summary["narration"] = say
+        def narrate_report():
+            say = gov.narrate(
+                "flood report",
+                f"Preset {fs['preset']} ({routed}): {fs['requests']} requests in {dur:.0f}s, "
+                f"peak KV {fs['peak_kv']:.0f}%, queue {round(fs['peak_queue'])}, "
+                f"pressure entries {fs['pressure_entries']}. " + " ".join(sugg[:2]))
+            if say:
+                summary["narration"] = say
+                print(f"   says: {say}", flush=True)
+        threading.Thread(target=narrate_report, daemon=True).start()
     return summary, sugg
 
 
@@ -568,15 +745,9 @@ def sequence_worker(gov):
             workers, mtok, dur = FLOOD_PRESETS[preset]
             gov.flood_preset = preset
             gov.sequence_step = preset
-            gov.flood_stats = {"preset": preset, "workers": workers,
-                               "max_tokens": mtok, "duration": dur,
-                               "started": time.time(),
-                               "requests": 0, "errors": 0, "waves": 0,
-                               "peak_kv": 0.0, "peak_queue": 0, "peak_running": 0,
-                               "pressure_entries": 0, "pressure_seconds": 0,
-                               "terse_activations": 0, "tok_s_samples": []}
+            gov.flood_stats = fresh_stats(preset, workers, mtok, dur, gov.governed)
             gov.flood_on = True
-            gov._activity(f"sequence: {preset} demand simulation started ({dur}s)")
+            gov._activity(f"sequence: {preset} demand started ({dur}s)")
             flood_worker(gov, workers, mtok, dur)
             summary, _sugg = build_flood_summary(gov, quiet=True)
             if summary:
@@ -600,6 +771,58 @@ def sequence_worker(gov):
             "The governor engaged terse mode automatically as pressure rose.")
         if say:
             gov.last_sequence["narration"] = say
+
+
+def compare_worker(gov, preset):
+    """Same preset, governor off then on, so the report is a measured A/B."""
+    prev = gov.governed
+    gov.compare_running = True
+    gov.sequence_abort = False
+    sides = []
+    try:
+        for governed, label in ((False, "off"), (True, "on")):
+            if gov.sequence_abort:
+                gov._activity("compare aborted")
+                break
+            workers, mtok, _dur = FLOOD_PRESETS[preset]
+            dur = COMPARE_SECONDS
+            gov.governed = governed
+            gov.flood_preset = preset
+            gov.flood_stats = fresh_stats(preset, workers, mtok, dur, governed)
+            gov.flood_on = True
+            gov._activity(f"compare: governor {label}, {preset} demand, {dur}s")
+            flood_worker(gov, workers, mtok, dur)
+            summary, _sugg = build_flood_summary(gov, quiet=True)
+            if summary:
+                summary["label"] = f"governor {label}"
+                sides.append(summary)
+            time.sleep(2)
+    finally:
+        gov.governed = prev
+        gov.flood_on = False
+        gov.compare_running = False
+        gov.sequence_abort = False
+    verdict = ""
+    if len(sides) == 2:
+        off, on = sides
+        bits = []
+        if on["peak_queue"] != off["peak_queue"]:
+            bits.append(f"Peak queue {off['peak_queue']} with the governor off, {on['peak_queue']} with it on.")
+        if (isinstance(off.get("avg_latency"), (int, float))
+                and isinstance(on.get("avg_latency"), (int, float))):
+            bits.append(f"Average response {off['avg_latency']}s off, {on['avg_latency']}s on.")
+        if on["pressure_entries"] or off["pressure_entries"]:
+            bits.append(
+                f"PRESSURE entries: {off['pressure_entries']} off, {on['pressure_entries']} on.")
+        verdict = " ".join(bits) or "Both sides finished. Compare the table."
+    gov.last_compare = {"preset": preset, "sides": sides, "verdict": verdict, "narration": None}
+    gov._activity("compare complete -- see Flood report")
+    if verdict:
+        def narrate():
+            say = gov.narrate("governor off versus on", verdict)
+            if say and gov.last_compare:
+                gov.last_compare["narration"] = say
+        threading.Thread(target=narrate, daemon=True).start()
 
 
 # ----------------------------------------------------------------------------
@@ -632,7 +855,7 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
 .pill{background:#1c2530;border:1px solid #2c3a4a;color:#cfe3ff;padding:8px 18px;border-radius:20px;cursor:pointer;font-size:14px}
 .pill:hover{border-color:#4d6a8a}
 .pill.active{background:#b3540a;border-color:#b3540a;color:#fff;font-weight:bold}
-.pill.stop{border-color:#5a2c2c}
+.pill.live{background:#1d7a3a;border-color:#1d7a3a;color:#fff;font-weight:bold}
 #report{background:#0a0e14;border-radius:8px;padding:12px;font-size:13px}
 #report ul{margin:8px 0;padding-left:20px}
 #report li{margin:4px 0}
@@ -679,16 +902,20 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
  <div class="tile"><div class="v" id="kv">-</div><div class="l">KV cache</div></div>
  <div class="tile"><div class="v" id="waiting">-</div><div class="l">queued</div></div>
  <div class="tile"><div class="v" id="running">-</div><div class="l">running</div></div>
- <div class="tile"><div class="v" id="ttft">-</div><div class="l">TTFT avg (s)</div></div>
+ <div class="tile"><div class="v" id="ttft">-</div><div class="l">TTFT 30s</div></div>
+ <div class="tile"><div class="v" id="qtime">-</div><div class="l">queue 30s</div></div>
  <div class="tile"><div class="v" id="tps">-</div><div class="l">tok/s</div></div>
- <div class="tile"><div class="v" id="hitrate">-</div><div class="l">prefix hit rate</div></div>
+ <div class="tile"><div class="v" id="hitrate">-</div><div class="l">prefix hit 30s</div></div>
+ <div class="tile"><div class="v" id="bound">-</div><div class="l">bottleneck</div></div>
 </div>
 <div class="pills">
  <button class="pill" data-preset="low" onclick="startFlood('low')">Low demand <span class="muted">30s</span></button>
  <button class="pill" data-preset="medium" onclick="startFlood('medium')">Medium demand <span class="muted">45s</span></button>
- <button class="pill" data-preset="high" onclick="startFlood('high')">High demand <span class="muted">60s</span></button>
+ <button class="pill" data-preset="high" onclick="startFlood('high')">High demand <span class="muted">40s</span></button>
  <button class="pill stop" onclick="stopFlood()">Stop</button>
- <button class="pill" onclick="startSequence()">&#9654; Full sequence <span class="muted">~2.5 min</span></button>
+ <button class="pill live" id="govtoggle" onclick="toggleGoverned()">Governor on</button>
+ <button class="pill" onclick="startCompare()">A/B compare <span class="muted">20s × 2</span></button>
+ <button class="pill" onclick="startSequence()">&#9654; Full sequence <span class="muted">~2 min</span></button>
  <button class="pill" onclick="cachepilot()">Run CachePilot</button>
  <span id="mstate" style="margin-left:12px;color:#9aa4b2"></span>
 </div>
@@ -701,6 +928,7 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
 <h3>Live activity <span id="floodbadge" class="fbadge" style="display:none">&#9679; FLOOD ACTIVE</span></h3>
 <div id="activity"><div>idle -- pick a demand pill above</div></div>
 <h3>Flood report</h3><div id="report"><div class="muted">run a flood, then stop it -- the report lands here</div></div>
+<h3>Librarian</h3><div id="librarian"><div class="muted">long chats compacted under pressure land here, with facts kept</div></div>
 <h3>Decision log</h3><div id="log"></div>
 <h3>CachePilot result</h3><pre id="cp">not run yet</pre>
 <script>
@@ -734,8 +962,13 @@ async function refresh(){
     document.getElementById('waiting').textContent = L.waiting ?? '-';
     document.getElementById('running').textContent = L.running ?? '-';
     document.getElementById('ttft').textContent = L.ttft_avg==null?'-':L.ttft_avg.toFixed(2);
+    document.getElementById('qtime').textContent = L.queue_avg==null?'-':L.queue_avg.toFixed(2);
     document.getElementById('tps').textContent = L.tok_per_s==null?'-':L.tok_per_s.toFixed(0);
     document.getElementById('hitrate').textContent = L.prefix_hit_rate==null?'-':(L.prefix_hit_rate*100).toFixed(1)+'%';
+    document.getElementById('bound').textContent = L.bottleneck || '-';
+    const govb = document.getElementById('govtoggle');
+    govb.textContent = s.governed ? 'Governor on' : 'Governor off';
+    govb.classList.toggle('live', !!s.governed);
     document.getElementById('mstate').textContent = s.metrics_ok ? '' : ('metrics error: '+(s.metrics_error||''));
     document.getElementById('log').innerHTML = (s.log||[]).slice().reverse().map(e=>
       '<div><span class="warnline">'+esc(e.t)+'</span> <b>'+esc(e.action)+'</b> &mdash; '+esc(e.detail)+''+(e.say?'<br><span class="say">&ldquo;'+esc(e.say)+'&rdquo;</span>':'')+'</div>').join('');
@@ -752,16 +985,35 @@ async function refresh(){
       const fp = s.flood_progress;
       document.getElementById('floodbar').style.width =
         Math.min(100, fp.elapsed / fp.total * 100) + '%';
-      const flabel = s.sequence_running ? ('sequence \u00b7 ' + (s.sequence_step || '') + ' demand')
-                                         : ((s.flood_preset || '') + ' demand simulation');
+      const flabel = s.compare_running ? 'A/B compare'
+                   : s.sequence_running ? ('sequence \u00b7 ' + (s.sequence_step || '') + ' demand')
+                   : ((s.flood_preset || '') + ' demand' + (s.governed ? ' \u00b7 governor on' : ' \u00b7 direct'));
       document.getElementById('floodtime').textContent = flabel + ': ' + fp.remaining + 's remaining';
     } else {
       fprog.style.display = 'none';
     }
+    const cmp = s.compare;
     const seq = s.sequence;
     const rep = s.summary;
     const rdiv = document.getElementById('report');
-    if (seq && seq.runs && seq.runs.length && !s.sequence_running){
+    const lib = s.compaction;
+    const ldiv = document.getElementById('librarian');
+    if (lib && lib.t){
+      const facts = lib.facts_total ? (lib.facts_kept + '/' + lib.facts_total + ' numeric facts kept') : 'no numeric facts in the dropped turns';
+      const kvb = lib.kv_before==null ? '-' : lib.kv_before + '%';
+      const kva = lib.kv_after==null ? '-' : lib.kv_after + '%';
+      ldiv.innerHTML = '<div><b>'+esc(lib.t)+'</b> compacted '+lib.before_turns+' turns down to '+lib.after_turns+'</div>'
+        +'<div>KV before <b>'+kvb+'</b> &middot; KV after <b>'+kva+'</b> &middot; '+esc(facts)+'</div>'
+        +'<div class="muted">'+esc(lib.summary||'')+'</div>';
+    }
+    if (cmp && cmp.sides && cmp.sides.length && !s.compare_running){
+      const rows = cmp.sides.map(x=>'<tr><td><b>'+(x.governed?'governor on':'governor off')+'</b></td><td>'+x.requests+'</td><td>'+x.errors+'</td><td>'+x.peak_queue+'</td><td>'+x.peak_kv+'%</td><td>'+x.avg_latency+'</td><td>'+x.avg_ttft+'</td><td>'+x.pressure_entries+'</td></tr>').join('');
+      rdiv.innerHTML =
+        '<div><b>Same '+esc(cmp.preset)+' demand, governor off then on</b></div>'
+        +'<table><tr><th>route</th><th>ok</th><th>errors</th><th>peak queue</th><th>peak KV</th><th>avg s</th><th>TTFT</th><th>PRESSURE</th></tr>'+rows+'</table>'
+        +(cmp.verdict?'<div>'+esc(cmp.verdict)+'</div>':'')
+        +(cmp.narration?'<div><span class="say">&ldquo;'+esc(cmp.narration)+'&rdquo;</span></div>':'');
+    } else if (seq && seq.runs && seq.runs.length && !s.sequence_running){
       const rows = seq.runs.map(x=>'<tr><td><b>'+esc(x.preset)+'</b></td><td>'+x.requests+'</td><td>'+x.peak_kv+'%</td><td>'+x.peak_queue+'</td><td>'+x.pressure_entries+'</td><td>'+x.terse_activations+'</td></tr>').join('');
       rdiv.innerHTML =
         '<div><b>Full sequence complete: low &rarr; medium &rarr; high</b></div>'
@@ -770,8 +1022,9 @@ async function refresh(){
         +(seq.narration?'<div><span class="say">&ldquo;'+esc(seq.narration)+'&rdquo;</span></div>':'');
     } else if (rep && rep.preset){
       rdiv.innerHTML =
-        '<div><b>'+esc(rep.preset)+' demand</b> &mdash; '+rep.requests+' requests, '+rep.errors+' errors, '+rep.waves+' waves in '+rep.duration_s+'s</div>'
-        +'<div>peak KV <b>'+rep.peak_kv+'%</b> &middot; peak queue <b>'+rep.peak_queue+'</b> &middot; peak running <b>'+rep.peak_running+'</b> &middot; avg throughput <b>'+rep.avg_tok_s+'</b> tok/s</div>'
+        '<div><b>'+esc(rep.preset)+' demand</b> &mdash; '+rep.requests+' ok, '+rep.errors+' errors, '+rep.waves+' launched in '+rep.duration_s+'s'
+        +' &middot; '+(rep.governed?'governor on':'direct')+'</div>'
+        +'<div>peak KV <b>'+rep.peak_kv+'%</b> &middot; peak queue <b>'+rep.peak_queue+'</b> &middot; peak running <b>'+rep.peak_running+'</b> &middot; avg response <b>'+rep.avg_latency+'</b>s &middot; TTFT <b>'+rep.avg_ttft+'</b>s &middot; queue time <b>'+rep.avg_queue+'</b>s</div>'
         +'<div>PRESSURE entries: <b>'+rep.pressure_entries+'</b> (~'+Math.round(rep.pressure_seconds)+'s) &middot; terse activations: <b>'+rep.terse_activations+'</b></div>'
         +'<ul>'+rep.suggestions.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'
         +(rep.narration?'<div><span class="say">&ldquo;'+esc(rep.narration)+'&rdquo;</span></div>':'');
@@ -783,6 +1036,13 @@ async function startFlood(p){
 }
 async function stopFlood(){
   await fetch('/api/flood/stop',{method:'POST'});
+}
+async function toggleGoverned(){
+  const on = document.getElementById('govtoggle').textContent.indexOf('off') >= 0;
+  await fetch('/api/governed?on='+(on?'1':'0'),{method:'POST'});
+}
+async function startCompare(){
+  await fetch('/api/compare/start?preset=high',{method:'POST'});
 }
 async function startSequence(){
   await fetch('/api/sequence/start',{method:'POST'});
@@ -822,12 +1082,15 @@ class DashHandler(BaseHTTPRequestHandler):
                 payload = {"state": g.state, "latest": g.latest,
                            "policy": g.policy, "log": g.log, "activity": g.activity,
                            "metrics_ok": g.metrics_ok, "metrics_error": g.metrics_error,
-                           "health": g.health,
+                           "health": g.health, "governed": g.governed,
+                           "compaction": g.last_compaction,
                            "flood_on": g.flood_on, "flood_preset": g.flood_preset,
                            "flood_progress": fp, "summary": g.last_summary,
                            "sequence_running": g.sequence_running,
                            "sequence_step": g.sequence_step,
-                           "sequence": g.last_sequence}
+                           "sequence": g.last_sequence,
+                           "compare_running": g.compare_running,
+                           "compare": g.last_compare}
             self._send(json.dumps(payload).encode(), "application/json")
         else:
             self._send(b"not found", "text/plain", 404)
@@ -838,31 +1101,49 @@ class DashHandler(BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             preset = qs.get("preset", ["medium"])[0]
             workers, mtok, dur = FLOOD_PRESETS.get(preset, FLOOD_PRESETS["medium"])
-            if not g.flood_on:
+            if not g.flood_on and not g.compare_running:
                 g.last_sequence = None
+                g.last_compare = None
                 g.flood_preset = preset
-                g.flood_stats = {"preset": preset, "workers": workers,
-                                 "max_tokens": mtok, "duration": dur, "started": time.time(), 
-                                 "requests": 0, "errors": 0, "waves": 0,
-                                 "peak_kv": 0.0, "peak_queue": 0, "peak_running": 0,
-                                 "pressure_entries": 0, "pressure_seconds": 0,
-                                 "terse_activations": 0, "tok_s_samples": []}
+                g.flood_stats = fresh_stats(preset, workers, mtok, dur, g.governed)
                 g.flood_on = True
-                g._activity(f"flood started: {preset} demand ({workers} workers x {mtok} tokens)")
+                route = "proxy" if g.governed else "direct"
+                g._activity(f"flood started: {preset} demand ({workers} in flight, {route})")
                 threading.Thread(target=flood_worker, args=(g, workers, mtok, dur),
                                  daemon=True).start()
             self._send(b'{"ok":true}', "application/json")
         elif self.path == "/api/flood/stop":
-            if g.sequence_running:
+            if g.sequence_running or g.compare_running:
                 g.sequence_abort = True
-                g._activity("sequence abort requested")
+                g._activity("stop requested")
             if g.flood_on:
                 g.flood_on = False
-                g._activity("flood stopped -- generating report")
-                threading.Thread(target=build_flood_summary, args=(g,), daemon=True).start()
+                if g.sequence_running or g.compare_running:
+                    g._activity("flood stopped")
+                else:
+                    g._activity("flood stopped -- generating report")
+                    threading.Thread(target=build_flood_summary, args=(g,), daemon=True).start()
+            self._send(b'{"ok":true}', "application/json")
+        elif self.path.startswith("/api/governed"):
+            if g.flood_on or g.compare_running or g.sequence_running:
+                self._send(b'{"ok":false}', "application/json")
+            else:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                g.governed = qs.get("on", ["1"])[0] != "0"
+                g._activity("governor routing " + ("on" if g.governed else "off"))
+                self._send(b'{"ok":true}', "application/json")
+        elif self.path.startswith("/api/compare/start"):
+            if not g.compare_running and not g.flood_on and not g.sequence_running:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                preset = qs.get("preset", ["high"])[0]
+                if preset not in FLOOD_PRESETS:
+                    preset = "high"
+                g.last_compare = None
+                g.sequence_abort = False
+                threading.Thread(target=compare_worker, args=(g, preset), daemon=True).start()
             self._send(b'{"ok":true}', "application/json")
         elif self.path == "/api/sequence/start":
-            if not g.sequence_running and not g.flood_on:
+            if not g.sequence_running and not g.flood_on and not g.compare_running:
                 g.sequence_abort = False
                 g.last_sequence = None
                 threading.Thread(target=sequence_worker, args=(g,), daemon=True).start()
@@ -891,19 +1172,64 @@ class DashHandler(BaseHTTPRequestHandler):
 # ----------------------------------------------------------------------------
 # Optional OpenAI-compatible proxy (applies the active policy)
 # ----------------------------------------------------------------------------
-def apply_terse(body):
+def librarian_compact(gov, msgs):
+    """Summarize older turns and record how many numeric facts survived."""
+    if len(msgs) <= 8:
+        return msgs, None
+    head = [m for m in msgs if m.get("role") == "system"]
+    rest = [m for m in msgs if m.get("role") != "system"]
+    if len(rest) <= 6:
+        return msgs, None
+    older, recent = rest[:-4], rest[-4:]
+    older_text = "\n".join(
+        f"{m.get('role', 'user')}: {m.get('content', '')}" for m in older)[:4000]
+    with gov.lock:
+        kv_before = (gov.latest or {}).get("kv")
+    summary = ""
+    try:
+        r = requests.post(VLLM_BASE + "/v1/chat/completions", timeout=25, json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content":
+                          "Summarize the conversation below in under 80 words. "
+                          "Keep every number, date, and dollar amount exactly.\n\n"
+                          + older_text}],
+            "max_tokens": 120, "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": False}})
+        summary = r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        summary = ""
+    facts, kept = retained_facts(older_text, summary)
+    if not summary:
+        summary = "[governor compacted older history; the summary call did not return]"
+        kept = 0
+    event = {
+        "t": datetime.now().strftime("%H:%M:%S"),
+        "before_turns": len(rest),
+        "after_turns": len(recent) + (1 if summary else 0),
+        "facts_total": len(facts),
+        "facts_kept": kept,
+        "kv_before": None if kv_before is None else round(kv_before * 100),
+        "kv_after": None,
+        "summary": summary[:400],
+    }
+    note = {"role": "system", "content": "[governor memory] " + summary}
+    return head + [note] + recent, event
+
+
+def apply_terse(gov, body):
     body = dict(body)
     if body.get("max_tokens"):
-        body["max_tokens"] = min(body["max_tokens"], 128)
+        body["max_tokens"] = min(int(body["max_tokens"]), 128)
     else:
         body["max_tokens"] = 128
+    kwargs = dict(body.get("chat_template_kwargs") or {})
+    kwargs["enable_thinking"] = False
+    body["chat_template_kwargs"] = kwargs
     msgs = list(body.get("messages", []))
-    # librarian compaction: keep system + last 6 turns
-    if len(msgs) > 8:
-        head = [m for m in msgs if m.get("role") == "system"]
-        msgs = head + [{"role": "system",
-                        "content": "[governor compacted older history to protect the engine]"}] \
-            + msgs[-6:]
+    msgs, event = librarian_compact(gov, msgs)
+    if event is not None:
+        with gov.lock:
+            gov.last_compaction = event
     sys_msg = {"role": "system",
                "content": "[GOVERNOR TERSE MODE] Answer in 3 sentences or fewer. Be direct."}
     body["messages"] = [sys_msg] + msgs
@@ -912,6 +1238,24 @@ def apply_terse(body):
 
 class ProxyHandler(BaseHTTPRequestHandler):
     gov = None
+    protocol_version = "HTTP/1.1"
+
+    def _send_bytes(self, body, ctype, code=200):
+        data = body if isinstance(body, bytes) else body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _note_kv_after(self):
+        comp = self.gov.last_compaction
+        if not comp or comp.get("kv_after") is not None:
+            return
+        with self.gov.lock:
+            kv = (self.gov.latest or {}).get("kv")
+            if kv is not None and self.gov.last_compaction is comp:
+                comp["kv_after"] = round(kv * 100)
 
     def _proxy(self, method):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -922,26 +1266,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
             body = {}
         with self.gov.lock:
             terse = self.gov.policy.get("terse")
-        if method == "POST" and terse:
-            body = apply_terse(body)
+        if method == "POST" and terse and isinstance(body, dict):
+            body = apply_terse(self.gov, body)
+        stream = bool(isinstance(body, dict) and body.get("stream")) and method == "POST"
         try:
             if method == "GET":
                 r = requests.get(VLLM_BASE + self.path, timeout=30)
             else:
-                r = requests.post(VLLM_BASE + self.path, json=body, timeout=300)
+                r = requests.post(VLLM_BASE + self.path, json=body, timeout=300, stream=stream)
+                if (r.status_code >= 400 and isinstance(body, dict)
+                        and body.get("chat_template_kwargs")):
+                    # Older engines reject the thinking flag. Retry without it.
+                    fallback = dict(body)
+                    fallback.pop("chat_template_kwargs", None)
+                    r.close()
+                    r = requests.post(VLLM_BASE + self.path, json=fallback, timeout=300, stream=stream)
         except Exception as e:
-            err = json.dumps({"error": str(e)}).encode()
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(err)))
-            self.end_headers()
-            self.wfile.write(err)
+            self._send_bytes(json.dumps({"error": str(e)}), "application/json", 502)
             return
-        self.send_response(r.status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(r.content)))
-        self.end_headers()
-        self.wfile.write(r.content)
+        if stream:
+            self.send_response(r.status_code)
+            self.send_header("Content-Type", r.headers.get("Content-Type", "text/event-stream"))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for chunk in r.iter_content(chunk_size=None):
+                    if not chunk:
+                        continue
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            finally:
+                r.close()
+                self._note_kv_after()
+            return
+        self._note_kv_after()
+        self._send_bytes(r.content, "application/json", r.status_code)
 
     def do_GET(self):
         self._proxy("GET")
@@ -965,6 +1331,7 @@ def main():
     args = ap.parse_args()
 
     gov = Governor(allow_restart=args.allow_restart)
+    gov.proxy_base = f"http://127.0.0.1:{args.proxy_port}"
     DashHandler.gov = gov
     ProxyHandler.gov = gov
 

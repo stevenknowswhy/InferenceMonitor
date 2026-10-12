@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+"""Autopilot Governor -- an agent that owns its inference.
+
+Sidecar control loop for a self-hosted vLLM engine:
+  1. Scrapes /metrics (auto-discovers metric names across vLLM versions).
+  2. Classifies pressure with deterministic rules + hysteresis.
+     (The 4B model never makes operational decisions -- Python does.
+     The model only narrates.)
+  3. Actuates without restarts first:
+       - terse mode (shorter answers, capped max_tokens) via the proxy
+       - librarian compaction (truncate stale history) via the proxy
+       - Prefix-Cache Pilot (restructure prompts for cache reuse)
+     ...then kubectl rollout restart as the closer (opt-in: --allow-restart).
+  4. Narrates every decision through the model itself.
+  5. Serves a live dashboard and an optional OpenAI-compatible proxy.
+
+The Prefix-Cache Pilot lives inside as actuator #3 (dashboard button +
+shared telemetry) and as a standalone demo: cachepilot.py.
+
+Run:
+    pip install -r requirements.txt
+    python3 governor.py                       # dashboard :8081, proxy :8082
+    python3 governor.py --allow-restart       # enables the restart closer
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: pip install -r requirements.txt")
+
+# ----------------------------------------------------------------------------
+# Config (overridable via env)
+# ----------------------------------------------------------------------------
+VLLM_BASE = os.environ.get("VLLM_BASE", "http://localhost:8000")
+MODEL = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B")
+KUBECONFIG = os.environ.get("KUBECONFIG", os.path.expanduser("~/MidwestProject/s01.yaml"))
+NAMESPACE = os.environ.get("NAMESPACE", "workshop-s12")
+DEPLOYMENT = os.environ.get("VLLM_DEPLOYMENT", "vllm")
+
+POLL_SECS = 2.0
+KV_PRESSURE = 0.85
+QUEUE_PRESSURE = 4
+ENTER_AFTER = 3
+EXIT_AFTER = 5
+RECOVERY_COOLDOWN = 90
+# Scheduler slots on this deployment (--max-num-seqs). Used only for the
+# live safety lamp, so medium demand can show Warning before the engine
+# actually crosses the protection line.
+MAX_NUM_SEQS = int(os.environ.get("MAX_NUM_SEQS", "32"))
+HEALTH_WARN = 0.30
+HEALTH_WARN_EXIT = 0.18
+HEALTH_SCALE = 1.15
+HEALTH_RANK = {"": 0, "safe": 1, "warning": 2, "danger": 3}
+
+METRIC_CANDIDATES = {
+    "waiting":        ["vllm:num_requests_waiting"],
+    "running":        ["vllm:num_requests_running"],
+    "kv":             ["vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc",
+                         "vllm:gpu_cache_usage_factor"],
+    "ttft_sum":       ["vllm:time_to_first_token_seconds_sum"],
+    "ttft_cnt":       ["vllm:time_to_first_token_seconds_count"],
+    "prompt_tok":     ["vllm:prompt_tokens_total"],
+    "gen_tok":        ["vllm:generation_tokens_total"],
+    "prefix_hits":    ["vllm:gpu_prefix_cache_hits_total", "vllm:prefix_cache_hits_total"],
+    "prefix_queries": ["vllm:gpu_prefix_cache_queries_total", "vllm:prefix_cache_queries_total"],
+    "prefix_rate":    ["vllm:gpu_prefix_cache_hit_rate"],
+}
+
+
+# ----------------------------------------------------------------------------
+# Metrics
+# ----------------------------------------------------------------------------
+class MetricsScraper:
+    def __init__(self, base):
+        self.base = base.rstrip("/")
+        self.resolved = {}
+        self._prev = {}
+        self._prev_t = None
+
+    @staticmethod
+    def _parse(text):
+        vals = {}
+        for line in text.splitlines():
+            if not line.startswith("vllm:"):
+                continue
+            m = re.match(r"^(vllm:[a-zA-Z0-9_:]+)(?:\{[^}]*\})?\s+([0-9.eE+\-]+)", line)
+            if m:
+                vals[m.group(1)] = float(m.group(2))
+        return vals
+
+    def _resolve(self, vals):
+        for canon, cands in METRIC_CANDIDATES.items():
+            if canon not in self.resolved:
+                for c in cands:
+                    if c in vals:
+                        self.resolved[canon] = c
+                        break
+
+    def snapshot(self):
+        r = requests.get(self.base + "/metrics", timeout=10)
+        r.raise_for_status()
+        vals = self._parse(r.text)
+        self._resolve(vals)
+        now = time.time()
+
+        def get(canon, default=0.0):
+            name = self.resolved.get(canon)
+            return vals.get(name, default) if name else default
+
+        snap = {"ts": now, "found": dict(self.resolved)}
+        snap["waiting"] = get("waiting")
+        snap["running"] = get("running")
+        kv = get("kv")
+        snap["kv"] = kv / 100.0 if kv > 1.5 else kv
+        s, c = get("ttft_sum"), get("ttft_cnt")
+        snap["ttft_avg"] = None
+        if self._prev and c > self._prev.get("ttft_cnt", 0):
+            dc = c - self._prev["ttft_cnt"]
+            if dc > 0:
+                snap["ttft_avg"] = (s - self._prev.get("ttft_sum", s)) / dc
+        dt = now - self._prev_t if self._prev_t else 0
+        snap["tok_per_s"] = None
+        if dt > 0 and self._prev:
+            d = (get("prompt_tok") + get("gen_tok")
+                 - self._prev.get("prompt_tok", 0) - self._prev.get("gen_tok", 0))
+            if d >= 0:
+                snap["tok_per_s"] = d / dt
+        if self.resolved.get("prefix_rate"):
+            snap["prefix_hit_rate"] = get("prefix_rate")
+        else:
+            h, q = get("prefix_hits"), get("prefix_queries")
+            snap["prefix_hit_rate"] = (h / q) if q > 0 else None
+        self._prev = {"ttft_sum": s, "ttft_cnt": c,
+                      "prompt_tok": get("prompt_tok"), "gen_tok": get("gen_tok")}
+        self._prev_t = now
+        return snap
+
+
+# ----------------------------------------------------------------------------
+# Live safety lamp: safe -> warning -> danger (output may be degraded)
+# ----------------------------------------------------------------------------
+def assess_health(snap, state, terse, previous, exit_streak):
+    """Map one metrics sample onto safe, warning, or danger.
+
+    Danger means replies are being shortened, the engine is restarting, or a
+    protection threshold has already been crossed. Warning is elevated load
+    short of that line. The lamp steps up on the first sample and steps down
+    one band at a time, after two calmer samples, so a gap between flood waves
+    does not flicker.
+    """
+    kv = float((snap or {}).get("kv") or 0)
+    waiting = float((snap or {}).get("waiting") or 0)
+    running = float((snap or {}).get("running") or 0)
+    kv_score = kv / KV_PRESSURE if KV_PRESSURE else 0.0
+    queue_score = waiting / float(QUEUE_PRESSURE) if QUEUE_PRESSURE else 0.0
+    slot_score = running / float(MAX_NUM_SEQS) if MAX_NUM_SEQS else 0.0
+    score = max(kv_score, queue_score, slot_score)
+    driver = max(
+        (("KV cache", kv_score), ("queue", queue_score), ("in-flight requests", slot_score)),
+        key=lambda item: item[1],
+    )[0]
+    tripped = (
+        state in ("PRESSURE", "RECOVERY")
+        or terse
+        or kv >= KV_PRESSURE
+        or waiting >= QUEUE_PRESSURE
+    )
+    if tripped:
+        raw = "danger"
+    elif score >= HEALTH_WARN or (
+        previous in ("warning", "danger") and score >= HEALTH_WARN_EXIT
+    ):
+        raw = "warning"
+    else:
+        raw = "safe"
+
+    if previous and HEALTH_RANK[raw] < HEALTH_RANK.get(previous, 0):
+        exit_streak += 1
+        if exit_streak >= 2:
+            stepped = HEALTH_RANK[previous] - 1
+            level = next(name for name, rank in HEALTH_RANK.items() if rank == stepped)
+            if HEALTH_RANK[raw] >= HEALTH_RANK[level]:
+                level = raw
+            exit_streak = 0
+        else:
+            level = previous
+    else:
+        level = raw
+        exit_streak = 0
+
+    if level == "danger":
+        display_score = max(score, 1.0)
+    elif level == "warning":
+        display_score = max(score, HEALTH_WARN)
+    else:
+        display_score = score
+    if state == "RECOVERY":
+        message = "Danger. The engine is restarting, so output may be unavailable."
+    elif level == "danger":
+        message = "Danger. Output may be degraded."
+    elif level == "warning":
+        message = "Warning. Load is rising. Answers are still full length."
+    else:
+        message = "Safe. The engine has headroom and answers are full length."
+    detail = (
+        f"KV {kv * 100:.0f}% · queue {waiting:.0f} · "
+        f"{running:.0f}/{MAX_NUM_SEQS} in flight · "
+        f"{min(display_score, HEALTH_SCALE) / HEALTH_SCALE * 100:.0f}% of the way to degraded output"
+        f" · driven by {driver}"
+    )
+    return {
+        "level": level,
+        "score": round(min(display_score, HEALTH_SCALE), 3),
+        "message": message,
+        "detail": detail,
+        "warn_at": HEALTH_WARN,
+        "danger_at": 1.0,
+        "scale": HEALTH_SCALE,
+        "exit_streak": exit_streak,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Governor: deterministic state machine (the model never decides -- it narrates)
+# ----------------------------------------------------------------------------
+class Governor:
+    def __init__(self, allow_restart=False):
+        self.scraper = MetricsScraper(VLLM_BASE)
+        self.allow_restart = allow_restart
+        self.lock = threading.Lock()
+        self.state = "NORMAL"
+        self.pressure_streak = 0
+        self.healthy_streak = 0
+        self.cooldown_until = 0
+        self.restart_used = False
+        self.policy = {"terse": False}
+        self.log = []
+        self.activity = []
+        self.flood_preset = None
+        self.flood_stats = None
+        self.last_summary = None
+        self.sequence_running = False
+        self.sequence_abort = False
+        self.sequence_step = None
+        self.last_sequence = None
+        self.latest = {}
+        self.flood_on = False
+        self.metrics_ok = True
+        self.metrics_error = ""
+        self.health_level = ""
+        self.health_exit_streak = 0
+        self.health = {
+            "level": "",
+            "score": 0,
+            "message": "Waiting for live metrics.",
+            "detail": "",
+            "warn_at": HEALTH_WARN,
+            "danger_at": 1.0,
+            "scale": HEALTH_SCALE,
+        }
+
+    def _log(self, action, detail, say=""):
+        entry = {"t": datetime.now().strftime("%H:%M:%S"),
+                 "action": action, "detail": detail, "say": say}
+        with self.lock:
+            self.log.append(entry)
+            self.log = self.log[-50:]
+        print(f"[{entry['t']}] {action}: {detail}", flush=True)
+        if say:
+            print(f"   says: {say}", flush=True)
+
+    def _activity(self, msg):
+        with self.lock:
+            self.activity.append({"t": datetime.now().strftime("%H:%M:%S"), "msg": msg})
+            self.activity = self.activity[-40:]
+
+    def narrate(self, trigger, action):
+        prompt = ("You are the Autopilot Governor, an agent that owns its inference engine. "
+                  f"In ONE sentence for a live demo audience, explain this: {trigger} "
+                  f"So you decided: {action}. Be concrete and confident.")
+        try:
+            r = requests.post(VLLM_BASE + "/v1/chat/completions", timeout=30, json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 80, "temperature": 0.3})
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            return f"(narrator offline) {action}."
+
+    def tick(self):
+        try:
+            snap = self.scraper.snapshot()
+            self.metrics_ok = True
+        except Exception as e:
+            self.metrics_ok = False
+            self.metrics_error = str(e)[:200]
+            self._publish_metrics_down()
+            return
+        with self.lock:
+            self.latest = snap
+        kv = snap.get("kv") or 0
+        waiting = snap.get("waiting") or 0
+        if self.flood_on and self.flood_stats:
+            fs = self.flood_stats
+            fs["peak_kv"] = max(fs["peak_kv"], kv * 100)
+            fs["peak_queue"] = max(fs["peak_queue"], waiting)
+            fs["peak_running"] = max(fs["peak_running"], snap.get("running") or 0)
+            ts = snap.get("tok_per_s")
+            if isinstance(ts, (int, float)):
+                fs["tok_s_samples"].append(ts)
+            if self.state == "PRESSURE":
+                fs["pressure_seconds"] += POLL_SECS
+        pressure = kv >= KV_PRESSURE or waiting >= QUEUE_PRESSURE
+        now = time.time()
+
+        if self.state == "NORMAL":
+            if pressure:
+                self.pressure_streak += 1
+                self.healthy_streak = 0
+                if self.pressure_streak >= ENTER_AFTER:
+                    self._enter_pressure(snap)
+            else:
+                self.pressure_streak = 0
+        elif self.state == "PRESSURE":
+            if pressure:
+                self.healthy_streak = 0
+                if (self.allow_restart and not self.restart_used
+                        and now >= self.cooldown_until):
+                    self._do_restart(snap)
+            else:
+                self.healthy_streak += 1
+                self.pressure_streak = 0
+                if self.healthy_streak >= EXIT_AFTER:
+                    self._exit_pressure(snap)
+        elif self.state == "RECOVERY":
+            if now >= self.cooldown_until and not pressure:
+                self._exit_pressure(snap)
+        self._publish_health(snap)
+
+    def _publish_health(self, snap):
+        view = assess_health(
+            snap, self.state, bool(self.policy.get("terse")),
+            self.health_level, self.health_exit_streak)
+        self.health_exit_streak = view.pop("exit_streak")
+        self.health_level = view["level"]
+        with self.lock:
+            self.health = view
+
+    def _publish_metrics_down(self):
+        # A missing scrape must not paint Safe. Hold Danger if that was the last real reading.
+        if self.health_level == "danger":
+            level, score = "danger", 1.0
+        else:
+            level = "warning"
+            score = max(self.health.get("score") or 0, HEALTH_WARN)
+        self.health_level = level
+        view = {
+            "level": level,
+            "score": round(score, 3),
+            "message": "Metrics are down, so this safety reading may be stale.",
+            "detail": self.metrics_error,
+            "warn_at": HEALTH_WARN,
+            "danger_at": 1.0,
+            "scale": HEALTH_SCALE,
+        }
+        with self.lock:
+            self.health = view
+
+    def _enter_pressure(self, snap):
+        self.state = "PRESSURE"
+        if self.flood_on and self.flood_stats:
+            self.flood_stats["pressure_entries"] += 1
+            if not self.policy["terse"]:
+                self.flood_stats["terse_activations"] += 1
+        self.policy["terse"] = True
+        detail = (f"KV {snap['kv']*100:.0f}% (thresh {KV_PRESSURE*100:.0f}), "
+                  f"queue {snap['waiting']:.0f} (thresh {QUEUE_PRESSURE}). "
+                  "Engaging TERSE mode: short answers, capped tokens, no restart yet.")
+        say = self.narrate(
+            f"engine pressure: KV cache {snap['kv']*100:.0f}%, {snap['waiting']:.0f} requests waiting",
+            "I'm switching to terse mode -- shorter answers, capped tokens -- to protect latency. No restart yet.")
+        self._log("ENTER_PRESSURE", detail, say)
+
+    def _exit_pressure(self, snap):
+        self.state = "NORMAL"
+        self.policy["terse"] = False
+        ttft = snap.get("ttft_avg")
+        detail = (f"Pressure cleared (KV {snap['kv']*100:.0f}%, queue {snap['waiting']:.0f}). "
+                  "Terse mode off." + (f" TTFT avg {ttft:.2f}s." if ttft else ""))
+        say = self.narrate("engine pressure cleared",
+                           "Standing down -- full answers restored. The intervention worked.")
+        self._log("RECOVERED", detail, say)
+
+    def _do_restart(self, snap):
+        self.restart_used = True
+        self.state = "RECOVERY"
+        self.cooldown_until = time.time() + RECOVERY_COOLDOWN
+        self._log("RESTART", "Pressure sustained -- restarting my own deployment (the closer).")
+        ok, out = self._kubectl_restart()
+        say = self.narrate(
+            f"terse mode wasn't enough (KV {snap['kv']*100:.0f}%)",
+            "I'm restarting my own engine now -- back in about a minute. This is what owning your inference means.")
+        self._log("RESTART_DONE" if ok else "RESTART_FAILED", out[-300:], say)
+
+    def _kubectl_restart(self):
+        cmd = ["kubectl", "--kubeconfig", KUBECONFIG, "-n", NAMESPACE,
+               "rollout", "restart", f"deployment/{DEPLOYMENT}"]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if p.returncode != 0:
+                return False, (p.stdout + p.stderr)[-300:]
+            w = subprocess.run(
+                ["kubectl", "--kubeconfig", KUBECONFIG, "-n", NAMESPACE,
+                 "rollout", "status", f"deployment/{DEPLOYMENT}", "--timeout=180s"],
+                capture_output=True, text=True, timeout=200)
+            return w.returncode == 0, (w.stdout + w.stderr)[-300:]
+        except Exception as e:
+            return False, str(e)[:300]
+
+
+# ----------------------------------------------------------------------------
+# Flood generator (in-process, toggled from the dashboard)
+# ----------------------------------------------------------------------------
+FLOOD_PRESETS = {
+    # preset: (workers, max_tokens, duration_seconds)
+    "low": (4, 150, 30),      # gentle, should stay NORMAL
+    "medium": (10, 300, 45),  # moderate -- may flirt with pressure
+    "high": (18, 600, 60),    # heavy -- should trigger PRESSURE
+}
+FLOOD_PROMPTS = [
+    "Write a detailed 400-word essay on the history of container orchestration, covering Borg, Omega, Kubernetes, and Nomad with dates and key design decisions.",
+    "Explain in depth how the transformer attention mechanism works, including Q/K/V projections, softmax scaling, multi-head attention, and KV caching, with equations.",
+    "Give a comprehensive overview of GPU memory hierarchies: registers, shared memory, L1/L2 cache, HBM, and how they affect LLM inference throughput.",
+    "Describe the full lifecycle of a Kubernetes pod from scheduling to termination, including probes, init containers, and graceful shutdown. Be thorough.",
+]
+
+
+def _flood_hit(gov, prompt, wave, wid, max_tokens):
+    t0 = time.time()
+    try:
+        r = requests.post(VLLM_BASE + "/v1/chat/completions", timeout=180, json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens, "temperature": 0.7})
+        gov._activity(f"wave {wave} worker {wid}: HTTP {r.status_code} in {time.time()-t0:.1f}s")
+        with gov.lock:
+            if gov.flood_stats:
+                gov.flood_stats["requests"] += 1
+    except Exception as e:
+        gov._activity(f"wave {wave} worker {wid}: ERROR {str(e)[:70]}")
+        with gov.lock:
+            if gov.flood_stats:
+                gov.flood_stats["errors"] += 1
+
+
+def flood_worker(gov, workers, max_tokens, duration):
+    deadline = time.time() + duration
+    wave = 0
+    while gov.flood_on and time.time() < deadline:
+        wave += 1
+        gov._activity(f"flood wave {wave}: launching {workers} concurrent requests")
+        with gov.lock:
+            if gov.flood_stats:
+                gov.flood_stats["waves"] = wave
+        threads = []
+        for k in range(workers):
+            t = threading.Thread(
+                target=_flood_hit,
+                args=(gov, FLOOD_PROMPTS[(wave + k) % len(FLOOD_PROMPTS)], wave, k, max_tokens),
+                daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=150)
+        time.sleep(1)
+    if gov.flood_on:
+        # simulation time expired -- auto-stop
+        gov.flood_on = False
+        if gov.sequence_running:
+            gov._activity(f"sequence {gov.flood_preset}: finished")
+        else:
+            gov._activity("flood finished: simulation time expired -- generating report")
+            build_flood_summary(gov)
+
+
+def build_flood_summary(gov, quiet=False):
+    """Called once when a flood stops: turn tracked stats into an improvement report.
+    quiet=True skips the dashboard write + narration (used by the sequence runner)."""
+    fs = gov.flood_stats
+    if not fs:
+        return None, []
+    dur = time.time() - fs["started"]
+    samples = fs["tok_s_samples"]
+    avg_ts = round(sum(samples) / len(samples), 1) if samples else None
+    sugg = []
+    if fs["pressure_entries"] == 0:
+        sugg.append(
+            f"PRESSURE never triggered on '{fs['preset']}' demand "
+            f"(peak KV {fs['peak_kv']:.0f}%, queue {round(fs['peak_queue'])}). The engine has "
+            "headroom at this load -- step up a preset or lower the pressure thresholds "
+            "if you want to exercise the governor's response.")
+    else:
+        sugg.append(
+            f"Governor entered PRESSURE {fs['pressure_entries']}x for ~{fs['pressure_seconds']}s "
+            f"and engaged terse mode {fs['terse_activations']}x. Peak KV {fs['peak_kv']:.0f}%, "
+            f"queue {round(fs['peak_queue'])}.") 
+        if fs["peak_kv"] >= 95:
+            sugg.append("KV cache nearly saturated -- in production this is where requests start "
+                        "failing outright. Consider shedding load earlier (lower the KV threshold) "
+                        "or adding capacity.")
+        if fs["pressure_seconds"] > 120:
+            sugg.append("Recovery was slow -- check whether terse mode is draining the queue fast "
+                        "enough, or whether the exit thresholds are too strict.")
+    if fs["errors"]:
+        sugg.append(f"{fs['errors']} requests errored -- the engine was over-saturated, not just slow. "
+                    "Earlier intervention would have helped.")
+    if avg_ts is not None and avg_ts < 50 and fs["requests"] > 0:
+        sugg.append("Throughput collapsed during the flood -- routing interactive users through "
+                    "the :8082 proxy lets terse mode protect them while the surge passes.")
+    sugg.append("Note: the flood hits the engine directly (like real external traffic), so terse "
+                "mode shapes only clients routed through the governor proxy on :8082.")
+    summary = {
+        "preset": fs["preset"], "duration_s": round(dur),
+        "requests": fs["requests"], "errors": fs["errors"], "waves": fs["waves"],
+        "peak_kv": round(fs["peak_kv"]), "peak_queue": round(fs["peak_queue"]),
+        "peak_running": fs["peak_running"],
+        "avg_tok_s": avg_ts if avg_ts is not None else "n/a",
+        "pressure_entries": fs["pressure_entries"],
+        "pressure_seconds": fs["pressure_seconds"],
+        "terse_activations": fs["terse_activations"],
+        "suggestions": sugg,
+    }
+    if not quiet:
+        gov.last_summary = summary
+        gov._activity("flood report ready -- see Flood report panel")
+        say = gov.narrate(
+            "flood report",
+            f"Preset {fs['preset']}: {fs['requests']} requests in {dur:.0f}s, peak KV "
+            f"{fs['peak_kv']:.0f}%, queue {round(fs['peak_queue'])}, "
+            f"pressure entries {fs['pressure_entries']}. " + " ".join(sugg[:2]))
+        if say:
+            summary["narration"] = say
+    return summary, sugg
+
+
+def sequence_worker(gov):
+    """Run low -> medium -> high back-to-back, then a combined comparison report."""
+    gov.sequence_running = True
+    gov.sequence_abort = False
+    runs = []
+    try:
+        for preset in ("low", "medium", "high"):
+            if gov.sequence_abort:
+                gov._activity("sequence aborted by user")
+                break
+            workers, mtok, dur = FLOOD_PRESETS[preset]
+            gov.flood_preset = preset
+            gov.sequence_step = preset
+            gov.flood_stats = {"preset": preset, "workers": workers,
+                               "max_tokens": mtok, "duration": dur,
+                               "started": time.time(),
+                               "requests": 0, "errors": 0, "waves": 0,
+                               "peak_kv": 0.0, "peak_queue": 0, "peak_running": 0,
+                               "pressure_entries": 0, "pressure_seconds": 0,
+                               "terse_activations": 0, "tok_s_samples": []}
+            gov.flood_on = True
+            gov._activity(f"sequence: {preset} demand simulation started ({dur}s)")
+            flood_worker(gov, workers, mtok, dur)
+            summary, _sugg = build_flood_summary(gov, quiet=True)
+            if summary:
+                runs.append(summary)
+                gov.last_summary = summary
+            time.sleep(3)
+    finally:
+        gov.flood_on = False
+        gov.sequence_running = False
+        gov.sequence_abort = False
+        gov.sequence_step = None
+    if runs:
+        gov.last_sequence = {"runs": runs, "narration": None}
+        gov._activity("sequence complete: low -> medium -> high -- see Flood report")
+        say = gov.narrate(
+            "full demand sequence",
+            "Ran low, medium, then high demand back to back. " +
+            " ".join(f"{r['preset']}: peak KV {r['peak_kv']}%, "
+                       f"{r['pressure_entries']} pressure entries, "
+                       f"{r['requests']} requests" for r in runs) + ". " +
+            "The governor engaged terse mode automatically as pressure rose.")
+        if say:
+            gov.last_sequence["narration"] = say
+
+
+# ----------------------------------------------------------------------------
+# Dashboard
+# ----------------------------------------------------------------------------
+DASH_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Autopilot Governor</title>
+<style>
+body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#0f1419;color:#e6e6e6;margin:0;padding:20px}
+h1{font-size:20px;margin:0 0 12px}
+.badge{display:inline-block;padding:4px 12px;border-radius:12px;font-weight:700}
+.NORMAL{background:#1d7a3a}.PRESSURE{background:#b3540a}.RECOVERY{background:#2b6cb0}
+.tiles{display:flex;gap:12px;flex-wrap:wrap;margin:16px 0}
+.tile{background:#1a2230;border-radius:8px;padding:12px 16px;min-width:120px}
+.tile .v{font-size:24px;font-weight:700}.tile .l{font-size:12px;color:#9aa4b2}
+#log{background:#0a0e14;border-radius:8px;padding:12px;height:260px;overflow-y:auto;font-family:monospace;font-size:12px}
+#log div{margin-bottom:6px;border-bottom:1px solid #1c2532;padding-bottom:6px}
+button{background:#2b6cb0;color:#fff;border:0;border-radius:6px;padding:8px 14px;margin-right:8px;cursor:pointer;font-size:14px}
+button.warn{background:#b3540a}
+.warnline{color:#f0b429}
+pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-size:12px}
+.say{color:#7ee2a8}
+#activity{background:#0a0e14;border-radius:8px;padding:12px;height:180px;overflow-y:auto;font-family:monospace;font-size:12px;color:#8fd0ff}
+#activity div{animation:fadein .4s}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+.fbadge{background:#b3540a;color:#fff;font-size:12px;padding:3px 10px;border-radius:10px;animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.cursor{animation:pulse 1s infinite;color:#8fd0ff}
+.pills{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap}
+.pill{background:#1c2530;border:1px solid #2c3a4a;color:#cfe3ff;padding:8px 18px;border-radius:20px;cursor:pointer;font-size:14px}
+.pill:hover{border-color:#4d6a8a}
+.pill.active{background:#b3540a;border-color:#b3540a;color:#fff;font-weight:bold}
+.pill.stop{border-color:#5a2c2c}
+#report{background:#0a0e14;border-radius:8px;padding:12px;font-size:13px}
+#report ul{margin:8px 0;padding-left:20px}
+#report li{margin:4px 0}
+#report table{border-collapse:collapse;margin:8px 0}
+#report td,#report th{border:1px solid #2c3a4a;padding:4px 10px;font-size:12px;text-align:left}
+#report th{color:#9aa4b2;font-weight:600}
+.muted{color:#7d8ea3}
+.health-head{display:flex;align-items:center;gap:8px;margin:16px 0 8px}
+.health-head h2{font-size:13px;margin:0;letter-spacing:.08em;text-transform:uppercase;color:#9aa4b2}
+.live-dot{width:8px;height:8px;border-radius:50%;background:#3ddc84;box-shadow:0 0 8px #3ddc84;animation:pulse 1.2s infinite;display:inline-block}
+.modes{display:flex;gap:10px;align-items:stretch}
+.mode{flex:1;background:#1a2230;border:2px solid #243044;border-radius:10px;padding:12px 14px;opacity:.4;transition:opacity .35s,border-color .35s,box-shadow .35s}
+.mode .k{font-size:11px;letter-spacing:.14em;color:#9aa4b2}
+.mode .n{font-size:22px;font-weight:800;margin-top:2px}
+.mode .s{font-size:13px;color:#c5d0dc;margin-top:4px;min-height:2.2em}
+.mode.safe .n{color:#3ddc84}
+.mode.warning .n{color:#f0c14a}
+.mode.danger .n{color:#ff6b6b}
+.mode.on{opacity:1}
+.mode.safe.on{border-color:#1d7a3a;box-shadow:0 0 18px rgba(29,122,58,.35)}
+.mode.warning.on{border-color:#d4a017;box-shadow:0 0 18px rgba(212,160,23,.28)}
+.mode.danger.on{border-color:#c53030;box-shadow:0 0 18px rgba(197,48,48,.4)}
+.meter{position:relative;margin:12px 0 4px;height:20px}
+.meter .track{height:14px;border-radius:8px}
+.meter .needle{position:absolute;top:-3px;width:3px;height:20px;background:#fff;border-radius:2px;box-shadow:0 0 6px #fff;transform:translateX(-1px);transition:left .45s ease}
+#healthmsg{margin:8px 0 0;font-size:15px;font-weight:700}
+#healthmsg.safe{color:#7ee2a8}
+#healthmsg.warning{color:#f0c14a}
+#healthmsg.danger{color:#ff8a8a}
+#healthdetail{font-size:12px;color:#7d8ea3;margin-top:2px}
+</style></head>
+<body>
+<h1>Autopilot Governor <span id="state" class="badge NORMAL">...</span></h1>
+<div class="health-head"><span class="live-dot"></span><h2>Service health, live</h2></div>
+<div class="modes" id="modes">
+ <div class="mode safe" data-level="safe"><div class="k">STEP 1</div><div class="n">Safe</div><div class="s">Full answers</div></div>
+ <div class="mode warning" data-level="warning"><div class="k">STEP 2</div><div class="n">Warning</div><div class="s">Load rising</div></div>
+ <div class="mode danger" data-level="danger"><div class="k">STEP 3</div><div class="n">Danger</div><div class="s">Output may be degraded</div></div>
+</div>
+<div class="meter"><div class="track" id="healthtrack"></div><div class="needle" id="healthneedle"></div></div>
+<div id="healthmsg">Waiting for live metrics.</div>
+<div id="healthdetail"></div>
+<div class="tiles">
+ <div class="tile"><div class="v" id="kv">-</div><div class="l">KV cache</div></div>
+ <div class="tile"><div class="v" id="waiting">-</div><div class="l">queued</div></div>
+ <div class="tile"><div class="v" id="running">-</div><div class="l">running</div></div>
+ <div class="tile"><div class="v" id="ttft">-</div><div class="l">TTFT avg (s)</div></div>
+ <div class="tile"><div class="v" id="tps">-</div><div class="l">tok/s</div></div>
+ <div class="tile"><div class="v" id="hitrate">-</div><div class="l">prefix hit rate</div></div>
+</div>
+<div class="pills">
+ <button class="pill" data-preset="low" onclick="startFlood('low')">Low demand <span class="muted">30s</span></button>
+ <button class="pill" data-preset="medium" onclick="startFlood('medium')">Medium demand <span class="muted">45s</span></button>
+ <button class="pill" data-preset="high" onclick="startFlood('high')">High demand <span class="muted">60s</span></button>
+ <button class="pill stop" onclick="stopFlood()">Stop</button>
+ <button class="pill" onclick="startSequence()">&#9654; Full sequence <span class="muted">~2.5 min</span></button>
+ <button class="pill" onclick="cachepilot()">Run CachePilot</button>
+ <span id="mstate" style="margin-left:12px;color:#9aa4b2"></span>
+</div>
+<div id="floodprog" style="display:none;margin:4px 0 12px">
+ <div style="background:#1c2530;border-radius:6px;height:10px;overflow:hidden">
+  <div id="floodbar" style="height:100%;width:0%;background:#b3540a;transition:width .5s"></div>
+ </div>
+ <div id="floodtime" class="muted" style="font-size:12px;margin-top:4px"></div>
+</div>
+<h3>Live activity <span id="floodbadge" class="fbadge" style="display:none">&#9679; FLOOD ACTIVE</span></h3>
+<div id="activity"><div>idle -- pick a demand pill above</div></div>
+<h3>Flood report</h3><div id="report"><div class="muted">run a flood, then stop it -- the report lands here</div></div>
+<h3>Decision log</h3><div id="log"></div>
+<h3>CachePilot result</h3><pre id="cp">not run yet</pre>
+<script>
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+async function refresh(){
+  try{
+    const r = await fetch('/api/status'); const s = await r.json();
+    const st = document.getElementById('state');
+    st.textContent = s.state; st.className = 'badge ' + s.state;
+    const h = s.health || {level:'', score:0, message:'Waiting for live metrics.', detail:'', warn_at:0.3, danger_at:1, scale:1.15};
+    document.querySelectorAll('.mode').forEach(el => {
+      el.classList.toggle('on', !!h.level && el.dataset.level === h.level);
+    });
+    const warn = h.warn_at || 0.3, danger = h.danger_at || 1, scale = h.scale || 1.15;
+    const score = h.score || 0;
+    let pos;
+    if (score <= warn) pos = (score / warn) * 33.3;
+    else if (score <= danger) pos = 33.3 + ((score - warn) / (danger - warn)) * 33.3;
+    else pos = 66.6 + ((score - danger) / Math.max(0.01, scale - danger)) * 33.4;
+    pos = Math.max(0, Math.min(100, pos));
+    document.getElementById('healthtrack').style.background =
+      'linear-gradient(90deg,#1d7a3a 0 33.3%,#d4a017 33.3% 66.6%,#c53030 66.6% 100%)';
+    document.getElementById('healthneedle').style.left = pos + '%';
+    const msg = document.getElementById('healthmsg');
+    msg.textContent = h.message || '';
+    msg.className = h.level || '';
+    document.getElementById('healthdetail').textContent = h.detail || '';
+    const L = s.latest || {};
+    const pct = x => x==null ? '-' : (x*100).toFixed(0)+'%';
+    document.getElementById('kv').textContent = pct(L.kv);
+    document.getElementById('waiting').textContent = L.waiting ?? '-';
+    document.getElementById('running').textContent = L.running ?? '-';
+    document.getElementById('ttft').textContent = L.ttft_avg==null?'-':L.ttft_avg.toFixed(2);
+    document.getElementById('tps').textContent = L.tok_per_s==null?'-':L.tok_per_s.toFixed(0);
+    document.getElementById('hitrate').textContent = L.prefix_hit_rate==null?'-':(L.prefix_hit_rate*100).toFixed(1)+'%';
+    document.getElementById('mstate').textContent = s.metrics_ok ? '' : ('metrics error: '+(s.metrics_error||''));
+    document.getElementById('log').innerHTML = (s.log||[]).slice().reverse().map(e=>
+      '<div><span class="warnline">'+esc(e.t)+'</span> <b>'+esc(e.action)+'</b> &mdash; '+esc(e.detail)+''+(e.say?'<br><span class="say">&ldquo;'+esc(e.say)+'&rdquo;</span>':'')+'</div>').join('');
+    document.getElementById('floodbadge').style.display = s.flood_on ? 'inline-block' : 'none';
+    document.getElementById('activity').innerHTML =
+      (s.activity||[]).slice().reverse().map(a=>'<div>['+esc(a.t)+'] '+esc(a.msg)+'</div>').join('')
+      + (s.flood_on ? '<div class="cursor">&#9613;</div>' : '');
+    document.querySelectorAll('.pill[data-preset]').forEach(b=>{
+      b.classList.toggle('active', s.flood_on && s.flood_preset===b.dataset.preset);
+    });
+    const fprog = document.getElementById('floodprog');
+    if (s.flood_on && s.flood_progress){
+      fprog.style.display = 'block';
+      const fp = s.flood_progress;
+      document.getElementById('floodbar').style.width =
+        Math.min(100, fp.elapsed / fp.total * 100) + '%';
+      const flabel = s.sequence_running ? ('sequence \u00b7 ' + (s.sequence_step || '') + ' demand')
+                                         : ((s.flood_preset || '') + ' demand simulation');
+      document.getElementById('floodtime').textContent = flabel + ': ' + fp.remaining + 's remaining';
+    } else {
+      fprog.style.display = 'none';
+    }
+    const seq = s.sequence;
+    const rep = s.summary;
+    const rdiv = document.getElementById('report');
+    if (seq && seq.runs && seq.runs.length && !s.sequence_running){
+      const rows = seq.runs.map(x=>'<tr><td><b>'+esc(x.preset)+'</b></td><td>'+x.requests+'</td><td>'+x.peak_kv+'%</td><td>'+x.peak_queue+'</td><td>'+x.pressure_entries+'</td><td>'+x.terse_activations+'</td></tr>').join('');
+      rdiv.innerHTML =
+        '<div><b>Full sequence complete: low &rarr; medium &rarr; high</b></div>'
+        +'<table><tr><th>demand</th><th>requests</th><th>peak KV</th><th>peak queue</th><th>PRESSURE</th><th>terse</th></tr>'+rows+'</table>'
+        +'<div class="muted">Read it left to right: the engine under rising load, and where the governor stepped in.</div>'
+        +(seq.narration?'<div><span class="say">&ldquo;'+esc(seq.narration)+'&rdquo;</span></div>':'');
+    } else if (rep && rep.preset){
+      rdiv.innerHTML =
+        '<div><b>'+esc(rep.preset)+' demand</b> &mdash; '+rep.requests+' requests, '+rep.errors+' errors, '+rep.waves+' waves in '+rep.duration_s+'s</div>'
+        +'<div>peak KV <b>'+rep.peak_kv+'%</b> &middot; peak queue <b>'+rep.peak_queue+'</b> &middot; peak running <b>'+rep.peak_running+'</b> &middot; avg throughput <b>'+rep.avg_tok_s+'</b> tok/s</div>'
+        +'<div>PRESSURE entries: <b>'+rep.pressure_entries+'</b> (~'+Math.round(rep.pressure_seconds)+'s) &middot; terse activations: <b>'+rep.terse_activations+'</b></div>'
+        +'<ul>'+rep.suggestions.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'
+        +(rep.narration?'<div><span class="say">&ldquo;'+esc(rep.narration)+'&rdquo;</span></div>':'');
+    }
+  }catch(e){}
+}
+async function startFlood(p){
+  await fetch('/api/flood/start?preset='+p,{method:'POST'});
+}
+async function stopFlood(){
+  await fetch('/api/flood/stop',{method:'POST'});
+}
+async function startSequence(){
+  await fetch('/api/sequence/start',{method:'POST'});
+}
+async function cachepilot(){
+  document.getElementById('cp').textContent = 'running...';
+  const r = await fetch('/api/cachepilot/run',{method:'POST'});
+  const j = await r.json();
+  document.getElementById('cp').textContent = j.text || JSON.stringify(j);
+}
+setInterval(refresh, 1000); refresh();
+</script></body></html>"""
+
+
+class DashHandler(BaseHTTPRequestHandler):
+    gov = None
+
+    def _send(self, body, ctype, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send(DASH_HTML.encode(), "text/html")
+        elif self.path == "/api/status":
+            g = self.gov
+            with g.lock:
+                fp = None
+                if g.flood_on and g.flood_stats:
+                    el = time.time() - g.flood_stats["started"]
+                    tot = g.flood_stats["duration"]
+                    fp = {"elapsed": round(el, 1), "total": tot,
+                          "remaining": max(0, int(tot - el))}
+                payload = {"state": g.state, "latest": g.latest,
+                           "policy": g.policy, "log": g.log, "activity": g.activity,
+                           "metrics_ok": g.metrics_ok, "metrics_error": g.metrics_error,
+                           "health": g.health,
+                           "flood_on": g.flood_on, "flood_preset": g.flood_preset,
+                           "flood_progress": fp, "summary": g.last_summary,
+                           "sequence_running": g.sequence_running,
+                           "sequence_step": g.sequence_step,
+                           "sequence": g.last_sequence}
+            self._send(json.dumps(payload).encode(), "application/json")
+        else:
+            self._send(b"not found", "text/plain", 404)
+
+    def do_POST(self):
+        g = self.gov
+        if self.path.startswith("/api/flood/start"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            preset = qs.get("preset", ["medium"])[0]
+            workers, mtok, dur = FLOOD_PRESETS.get(preset, FLOOD_PRESETS["medium"])
+            if not g.flood_on:
+                g.last_sequence = None
+                g.flood_preset = preset
+                g.flood_stats = {"preset": preset, "workers": workers,
+                                 "max_tokens": mtok, "duration": dur, "started": time.time(), 
+                                 "requests": 0, "errors": 0, "waves": 0,
+                                 "peak_kv": 0.0, "peak_queue": 0, "peak_running": 0,
+                                 "pressure_entries": 0, "pressure_seconds": 0,
+                                 "terse_activations": 0, "tok_s_samples": []}
+                g.flood_on = True
+                g._activity(f"flood started: {preset} demand ({workers} workers x {mtok} tokens)")
+                threading.Thread(target=flood_worker, args=(g, workers, mtok, dur),
+                                 daemon=True).start()
+            self._send(b'{"ok":true}', "application/json")
+        elif self.path == "/api/flood/stop":
+            if g.sequence_running:
+                g.sequence_abort = True
+                g._activity("sequence abort requested")
+            if g.flood_on:
+                g.flood_on = False
+                g._activity("flood stopped -- generating report")
+                threading.Thread(target=build_flood_summary, args=(g,), daemon=True).start()
+            self._send(b'{"ok":true}', "application/json")
+        elif self.path == "/api/sequence/start":
+            if not g.sequence_running and not g.flood_on:
+                g.sequence_abort = False
+                g.last_sequence = None
+                threading.Thread(target=sequence_worker, args=(g,), daemon=True).start()
+            self._send(b'{"ok":true}', "application/json")
+        elif self.path == "/api/cachepilot/run":
+            here = os.path.dirname(os.path.abspath(__file__))
+            try:
+                p = subprocess.run([sys.executable, os.path.join(here, "cachepilot.py"), "--json"],
+                                   capture_output=True, text=True, timeout=300)
+                out = p.stdout.strip() or p.stderr.strip()
+                try:
+                    self._send(json.dumps({"text": json.loads(out).get("text", out)}).encode(),
+                               "application/json")
+                except Exception:
+                    self._send(json.dumps({"text": out[-4000:]}).encode(), "application/json")
+            except Exception as e:
+                self._send(json.dumps({"text": f"cachepilot failed: {e}"}).encode(),
+                           "application/json")
+        else:
+            self._send(b"not found", "text/plain", 404)
+
+    def log_message(self, *a):
+        pass
+
+
+# ----------------------------------------------------------------------------
+# Optional OpenAI-compatible proxy (applies the active policy)
+# ----------------------------------------------------------------------------
+def apply_terse(body):
+    body = dict(body)
+    if body.get("max_tokens"):
+        body["max_tokens"] = min(body["max_tokens"], 128)
+    else:
+        body["max_tokens"] = 128
+    msgs = list(body.get("messages", []))
+    # librarian compaction: keep system + last 6 turns
+    if len(msgs) > 8:
+        head = [m for m in msgs if m.get("role") == "system"]
+        msgs = head + [{"role": "system",
+                        "content": "[governor compacted older history to protect the engine]"}] \
+            + msgs[-6:]
+    sys_msg = {"role": "system",
+               "content": "[GOVERNOR TERSE MODE] Answer in 3 sentences or fewer. Be direct."}
+    body["messages"] = [sys_msg] + msgs
+    return body
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    gov = None
+
+    def _proxy(self, method):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {}
+        with self.gov.lock:
+            terse = self.gov.policy.get("terse")
+        if method == "POST" and terse:
+            body = apply_terse(body)
+        try:
+            if method == "GET":
+                r = requests.get(VLLM_BASE + self.path, timeout=30)
+            else:
+                r = requests.post(VLLM_BASE + self.path, json=body, timeout=300)
+        except Exception as e:
+            err = json.dumps({"error": str(e)}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
+        self.send_response(r.status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(r.content)))
+        self.end_headers()
+        self.wfile.write(r.content)
+
+    def do_GET(self):
+        self._proxy("GET")
+
+    def do_POST(self):
+        self._proxy("POST")
+
+    def log_message(self, *a):
+        pass
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Autopilot Governor")
+    ap.add_argument("--dashboard-port", type=int, default=8081)
+    ap.add_argument("--proxy-port", type=int, default=8082)
+    ap.add_argument("--allow-restart", action="store_true",
+                    help="enable the kubectl rollout restart closer")
+    args = ap.parse_args()
+
+    gov = Governor(allow_restart=args.allow_restart)
+    DashHandler.gov = gov
+    ProxyHandler.gov = gov
+
+    dash = ThreadingHTTPServer(("127.0.0.1", args.dashboard_port), DashHandler)
+    threading.Thread(target=dash.serve_forever, daemon=True).start()
+    proxy = ThreadingHTTPServer(("127.0.0.1", args.proxy_port), ProxyHandler)
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
+
+    print(f"dashboard : http://localhost:{args.dashboard_port}", flush=True)
+    print(f"proxy     : http://localhost:{args.proxy_port}/v1  (model {MODEL})", flush=True)
+    print(f"watching  : {VLLM_BASE}   namespace {NAMESPACE}   restart actuator: "
+          f"{'ON' if args.allow_restart else 'off'}", flush=True)
+    try:
+        while True:
+            gov.tick()
+            time.sleep(POLL_SECS)
+    except KeyboardInterrupt:
+        print("\ngovernor stopped")
+
+
+if __name__ == "__main__":
+    main()

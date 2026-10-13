@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prefix-Cache Pilot -- standalone demo, also wired into the Governor dashboard.
+"""Prefix-Cache Pilot -- standalone demo, also wired into the Monitor dashboard.
 
 Proves that restructuring prompts around a shared prefix reuses the engine's
 prefix cache: measures per-request TTFT (streaming) and prefix-cache counter

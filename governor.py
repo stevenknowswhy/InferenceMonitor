@@ -24,9 +24,11 @@ Run:
 """
 
 import argparse
+import csv
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -336,6 +338,8 @@ class Governor:
         self.last_sequence = None
         self.latest = {}
         self.flood_on = False
+        self.live_responses = set()
+        self.hardware = {"ok": False, "error": "Reading the Akamai GPU…"}
         self.metrics_ok = True
         self.metrics_error = ""
         self.health_level = ""
@@ -360,6 +364,24 @@ class Governor:
         if say:
             print(f"   says: {say}", flush=True)
         return entry
+
+    def track_response(self, resp):
+        with self.lock:
+            self.live_responses.add(resp)
+
+    def untrack_response(self, resp):
+        with self.lock:
+            self.live_responses.discard(resp)
+
+    def abort_live(self):
+        """Close every flood connection so vLLM stops generating those replies."""
+        with self.lock:
+            live = list(self.live_responses)
+        closed = 0
+        for resp in live:
+            if _close_response(resp):
+                closed += 1
+        return closed
 
     def _activity(self, msg):
         with self.lock:
@@ -566,7 +588,34 @@ def fresh_stats(preset, workers, mtok, dur, governed):
         "pressure_entries": 0, "pressure_seconds": 0,
         "terse_activations": 0, "tok_s_samples": [],
         "ttft_samples": [], "queue_samples": [], "latency_samples": [],
+        "cancelled": 0,
     }
+
+
+def _close_response(resp):
+    """Drop the TCP connection behind a requests response, from any thread."""
+    if resp is None:
+        return False
+    try:
+        raw = getattr(resp, "raw", None)
+        conn = getattr(raw, "_connection", None) if raw is not None else None
+        sock = getattr(conn, "sock", None) if conn is not None else None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        resp.close()
+    except Exception:
+        pass
+    return True
 
 
 def _mean(xs):
@@ -575,31 +624,63 @@ def _mean(xs):
 
 
 def _flood_hit(gov, prompt, n, max_tokens):
+    if not gov.flood_on:
+        return
     t0 = time.time()
     ok = False
+    err = ""
+    cancelled = False
+    resp = None
     try:
         base = gov.proxy_base if gov.governed else VLLM_BASE
-        r = requests.post(base + "/v1/chat/completions", timeout=180, json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens, "temperature": 0.7})
-        ok = r.status_code < 400
-        err = "" if ok else f"HTTP {r.status_code}"
+        resp = requests.post(
+            base + "/v1/chat/completions",
+            timeout=180,
+            headers={"X-Governor-Flood": "1"},
+            stream=True,
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+                "stream": True,
+            })
+        gov.track_response(resp)
+        if not gov.flood_on:
+            cancelled = True
+        else:
+            for _chunk in resp.iter_content(chunk_size=4096):
+                if not gov.flood_on:
+                    cancelled = True
+                    break
+            if not cancelled:
+                ok = resp.status_code < 400
+                if not ok:
+                    err = f"HTTP {resp.status_code}"
     except Exception as e:
-        err = str(e)[:70]
+        if not gov.flood_on:
+            cancelled = True
+        else:
+            err = str(e)[:70]
+    finally:
+        if resp is not None:
+            gov.untrack_response(resp)
+            _close_response(resp)
     elapsed = time.time() - t0
     with gov.lock:
         fs = gov.flood_stats
         if not fs:
             return
         fs["finished"] = fs.get("finished", 0) + 1
-        if ok:
+        if cancelled:
+            fs["cancelled"] = fs.get("cancelled", 0) + 1
+        elif ok:
             fs["requests"] += 1
             fs["latency_samples"].append(elapsed)
         else:
             fs["errors"] += 1
         finished = fs["finished"]
-    if finished == 1 or finished % 8 == 0:
+    if not cancelled and (finished == 1 or finished % 8 == 0):
         route = "proxy" if gov.governed else "direct"
         tail = f" ({err})" if err else f" last {elapsed:.1f}s"
         gov._activity(f"{finished} finished via {route}{tail}")
@@ -665,6 +746,14 @@ def flood_worker(gov, workers, max_tokens, duration):
             build_flood_summary(gov)
 
 
+def _summarize_after_stop(gov):
+    """Let cancelled requests record themselves, then write the report once."""
+    time.sleep(0.8)
+    if gov.flood_on or gov.sequence_running or gov.compare_running:
+        return
+    build_flood_summary(gov)
+
+
 def build_flood_summary(gov, quiet=False):
     """Called once when a flood stops: turn tracked stats into an improvement report.
     quiet=True skips the dashboard write + narration (used by the sequence runner)."""
@@ -694,6 +783,8 @@ def build_flood_summary(gov, quiet=False):
             sugg.append("KV cache nearly saturated. This is where requests start failing outright.")
         if fs["pressure_seconds"] > 120:
             sugg.append("Recovery was slow. Check whether terse mode is draining the queue.")
+    if fs.get("cancelled"):
+        sugg.append(f"Stop closed {fs['cancelled']} request(s) that were still generating.")
     if fs["errors"]:
         sugg.append(f"{fs['errors']} requests errored. The engine was over-saturated, not just slow.")
     if fs.get("governed"):
@@ -886,6 +977,19 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
 #healthmsg.warning{color:#f0c14a}
 #healthmsg.danger{color:#ff8a8a}
 #healthdetail{font-size:12px;color:#7d8ea3;margin-top:2px}
+.hw{background:#1a2230;border-radius:10px;padding:14px 16px;margin:14px 0 4px}
+.hw-head{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-bottom:8px}
+.hw-head h2{font-size:13px;margin:0;letter-spacing:.08em;text-transform:uppercase;color:#9aa4b2}
+#hwname{font-size:15px;font-weight:650;color:#e6e6e6}
+.hbar{display:grid;grid-template-columns:72px minmax(0,1fr) max-content;align-items:center;gap:10px;margin:8px 0}
+.hbar .hl{font-size:12px;color:#9aa4b2}
+.htrack{background:#0a0e14;border-radius:6px;height:12px;overflow:hidden}
+.hfill{height:100%;width:0;border-radius:6px;transition:width .6s ease}
+#hwmem{background:#4c8dff}
+#hwcomp{background:#3ddc84}
+#hwpow{background:#f0c14a}
+.ht{font-size:12px;color:#c5d0dc;text-align:right;white-space:nowrap}
+@media (max-width:700px){.hbar{grid-template-columns:64px 1fr}.ht{grid-column:2}}
 </style></head>
 <body>
 <h1>Autopilot Governor <span id="state" class="badge NORMAL">...</span></h1>
@@ -898,6 +1002,13 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
 <div class="meter"><div class="track" id="healthtrack"></div><div class="needle" id="healthneedle"></div></div>
 <div id="healthmsg">Waiting for live metrics.</div>
 <div id="healthdetail"></div>
+<div class="hw">
+ <div class="hw-head"><h2>Akamai GPU</h2><span id="hwname">Reading the card…</span></div>
+ <div class="hbar"><div class="hl">VRAM</div><div class="htrack"><div class="hfill" id="hwmem"></div></div><div class="ht" id="hwmemt">-</div></div>
+ <div class="hbar"><div class="hl">Compute</div><div class="htrack"><div class="hfill" id="hwcomp"></div></div><div class="ht" id="hwcompt">-</div></div>
+ <div class="hbar"><div class="hl">Power</div><div class="htrack"><div class="hfill" id="hwpow"></div></div><div class="ht" id="hwpowt">-</div></div>
+ <div id="hwnote" class="muted"></div>
+</div>
 <div class="tiles">
  <div class="tile"><div class="v" id="kv">-</div><div class="l">KV cache</div></div>
  <div class="tile"><div class="v" id="waiting">-</div><div class="l">queued</div></div>
@@ -956,6 +1067,26 @@ async function refresh(){
     msg.textContent = h.message || '';
     msg.className = h.level || '';
     document.getElementById('healthdetail').textContent = h.detail || '';
+    const hw = s.hardware || {};
+    const bar = (id, pct) => { document.getElementById(id).style.width = Math.max(0, Math.min(100, pct || 0)) + '%'; };
+    if (hw.ok) {
+      document.getElementById('hwname').textContent = hw.name + ' · 1 GPU assigned';
+      bar('hwmem', hw.mem_pct);
+      document.getElementById('hwmemt').textContent = hw.mem_used_gib + ' / ' + hw.mem_total_gib + ' GiB';
+      bar('hwcomp', hw.compute_pct);
+      document.getElementById('hwcompt').textContent = hw.compute_pct + '%';
+      bar('hwpow', hw.power_pct);
+      document.getElementById('hwpowt').textContent = hw.power_w + ' / ' + hw.power_limit_w + ' W';
+      const kv = (s.latest && s.latest.kv != null) ? (s.latest.kv * 100).toFixed(0) + '% of the KV blocks' : 'KV cache idle';
+      document.getElementById('hwnote').textContent = 'Temp ' + hw.temp_c + '°C. ' + kv + '. VRAM stays occupied while the model is loaded; compute and power rise when the card is working.';
+    } else {
+      document.getElementById('hwname').textContent = hw.error || 'Reading the card…';
+      bar('hwmem', 0); bar('hwcomp', 0); bar('hwpow', 0);
+      document.getElementById('hwmemt').textContent = '-';
+      document.getElementById('hwcompt').textContent = '-';
+      document.getElementById('hwpowt').textContent = '-';
+      document.getElementById('hwnote').textContent = '';
+    }
     const L = s.latest || {};
     const pct = x => x==null ? '-' : (x*100).toFixed(0)+'%';
     document.getElementById('kv').textContent = pct(L.kv);
@@ -972,7 +1103,8 @@ async function refresh(){
     document.getElementById('mstate').textContent = s.metrics_ok ? '' : ('metrics error: '+(s.metrics_error||''));
     document.getElementById('log').innerHTML = (s.log||[]).slice().reverse().map(e=>
       '<div><span class="warnline">'+esc(e.t)+'</span> <b>'+esc(e.action)+'</b> &mdash; '+esc(e.detail)+''+(e.say?'<br><span class="say">&ldquo;'+esc(e.say)+'&rdquo;</span>':'')+'</div>').join('');
-    document.getElementById('floodbadge').style.display = s.flood_on ? 'inline-block' : 'none';
+    const stopb = document.querySelector('.pill.stop');
+    if (stopb && !s.flood_on && !s.sequence_running && !s.compare_running) stopb.textContent = 'Stop';
     document.getElementById('activity').innerHTML =
       (s.activity||[]).slice().reverse().map(a=>'<div>['+esc(a.t)+'] '+esc(a.msg)+'</div>').join('')
       + (s.flood_on ? '<div class="cursor">&#9613;</div>' : '');
@@ -1035,6 +1167,8 @@ async function startFlood(p){
   await fetch('/api/flood/start?preset='+p,{method:'POST'});
 }
 async function stopFlood(){
+  const b = document.querySelector('.pill.stop');
+  if (b) b.textContent = 'Stopping\u2026';
   await fetch('/api/flood/stop',{method:'POST'});
 }
 async function toggleGoverned(){
@@ -1083,6 +1217,7 @@ class DashHandler(BaseHTTPRequestHandler):
                            "policy": g.policy, "log": g.log, "activity": g.activity,
                            "metrics_ok": g.metrics_ok, "metrics_error": g.metrics_error,
                            "health": g.health, "governed": g.governed,
+                           "hardware": g.hardware,
                            "compaction": g.last_compaction,
                            "flood_on": g.flood_on, "flood_preset": g.flood_preset,
                            "flood_progress": fp, "summary": g.last_summary,
@@ -1113,16 +1248,15 @@ class DashHandler(BaseHTTPRequestHandler):
                                  daemon=True).start()
             self._send(b'{"ok":true}', "application/json")
         elif self.path == "/api/flood/stop":
-            if g.sequence_running or g.compare_running:
-                g.sequence_abort = True
-                g._activity("stop requested")
-            if g.flood_on:
-                g.flood_on = False
-                if g.sequence_running or g.compare_running:
-                    g._activity("flood stopped")
-                else:
-                    g._activity("flood stopped -- generating report")
-                    threading.Thread(target=build_flood_summary, args=(g,), daemon=True).start()
+            running_job = g.sequence_running or g.compare_running
+            g.sequence_abort = True
+            g.flood_on = False
+            closed = g.abort_live()
+            g._activity(f"stop: flood off, closed {closed} live request(s)")
+            if running_job:
+                g._activity("stop: winding down the sequence or compare")
+            else:
+                threading.Thread(target=_summarize_after_stop, args=(g,), daemon=True).start()
             self._send(b'{"ok":true}', "application/json")
         elif self.path.startswith("/api/governed"):
             if g.flood_on or g.compare_running or g.sequence_running:
@@ -1264,25 +1398,51 @@ class ProxyHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except Exception:
             body = {}
+        is_flood = self.headers.get("X-Governor-Flood") == "1"
         with self.gov.lock:
             terse = self.gov.policy.get("terse")
         if method == "POST" and terse and isinstance(body, dict):
             body = apply_terse(self.gov, body)
-        stream = bool(isinstance(body, dict) and body.get("stream")) and method == "POST"
+        if is_flood and isinstance(body, dict):
+            body = dict(body)
+            body["stream"] = True
+        stream = bool(isinstance(body, dict) and body.get("stream")) and method == "POST" and not is_flood
         try:
             if method == "GET":
                 r = requests.get(VLLM_BASE + self.path, timeout=30)
             else:
-                r = requests.post(VLLM_BASE + self.path, json=body, timeout=300, stream=stream)
+                r = requests.post(VLLM_BASE + self.path, json=body, timeout=300, stream=stream or is_flood)
                 if (r.status_code >= 400 and isinstance(body, dict)
                         and body.get("chat_template_kwargs")):
-                    # Older engines reject the thinking flag. Retry without it.
                     fallback = dict(body)
                     fallback.pop("chat_template_kwargs", None)
                     r.close()
-                    r = requests.post(VLLM_BASE + self.path, json=fallback, timeout=300, stream=stream)
+                    r = requests.post(VLLM_BASE + self.path, json=fallback, timeout=300,
+                                      stream=stream or is_flood)
         except Exception as e:
             self._send_bytes(json.dumps({"error": str(e)}), "application/json", 502)
+            return
+        if is_flood:
+            self.gov.track_response(r)
+            stopped = False
+            try:
+                for _chunk in r.iter_content(chunk_size=4096):
+                    if not self.gov.flood_on:
+                        stopped = True
+                        break
+            except Exception:
+                stopped = not self.gov.flood_on
+            finally:
+                self.gov.untrack_response(r)
+                _close_response(r)
+            try:
+                if stopped or not self.gov.flood_on:
+                    self._send_bytes(b'{"error":"stopped"}', "application/json", 499)
+                else:
+                    code = 200 if r.status_code < 400 else r.status_code
+                    self._send_bytes(b'{"ok":true}', "application/json", code)
+            except Exception:
+                pass
             return
         if stream:
             self.send_response(r.status_code)
@@ -1322,6 +1482,74 @@ class ProxyHandler(BaseHTTPRequestHandler):
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
+def _gpu_num(text):
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def discover_vllm_pod():
+    proc = subprocess.run(
+        ["kubectl", "--kubeconfig", KUBECONFIG, "-n", NAMESPACE,
+         "get", "pods", "-l", "app=vllm",
+         "--field-selector=status.phase=Running",
+         "-o", "jsonpath={.items[0].metadata.name}"],
+        capture_output=True, text=True, timeout=15)
+    name = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not name:
+        raise RuntimeError((proc.stderr or "no running vllm pod").strip()[:200])
+    return name
+
+
+def read_gpu(pod):
+    proc = subprocess.run(
+        ["kubectl", "--kubeconfig", KUBECONFIG, "-n", NAMESPACE,
+         "exec", pod, "-c", "vllm", "--",
+         "nvidia-smi",
+         "--query-gpu=name,memory.used,memory.total,utilization.gpu,power.draw,power.limit,temperature.gpu",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=15)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or "nvidia-smi failed").strip()[:200])
+    row = next(csv.reader([proc.stdout.strip()]))
+    if len(row) < 7:
+        raise RuntimeError("unexpected nvidia-smi row")
+    name, used, total, util, power, limit, temp = [part.strip() for part in row[:7]]
+    used_mib, total_mib = _gpu_num(used), _gpu_num(total)
+    power_w, limit_w = _gpu_num(power), _gpu_num(limit)
+    util_pct, temp_c = _gpu_num(util), _gpu_num(temp)
+    if not total_mib:
+        raise RuntimeError("GPU memory total missing")
+    return {
+        "ok": True,
+        "name": name,
+        "mem_used_gib": round(used_mib / 1024, 1),
+        "mem_total_gib": round(total_mib / 1024, 1),
+        "mem_pct": round(used_mib / total_mib * 100, 1),
+        "compute_pct": round(util_pct or 0, 1),
+        "power_w": round(power_w or 0, 1),
+        "power_limit_w": round(limit_w or 0, 1),
+        "power_pct": round((power_w or 0) / limit_w * 100, 1) if limit_w else 0,
+        "temp_c": round(temp_c or 0),
+    }
+
+
+def gpu_poll_loop(gov):
+    pod = None
+    while True:
+        try:
+            if not pod:
+                pod = discover_vllm_pod()
+            sample = read_gpu(pod)
+        except Exception as e:
+            pod = None
+            sample = {"ok": False, "error": str(e)[:200]}
+        with gov.lock:
+            gov.hardware = sample
+        time.sleep(4)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Autopilot Governor")
     ap.add_argument("--dashboard-port", type=int, default=8081)
@@ -1332,6 +1560,7 @@ def main():
 
     gov = Governor(allow_restart=args.allow_restart)
     gov.proxy_base = f"http://127.0.0.1:{args.proxy_port}"
+    threading.Thread(target=gpu_poll_loop, args=(gov,), daemon=True).start()
     DashHandler.gov = gov
     ProxyHandler.gov = gov
 

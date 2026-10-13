@@ -13,7 +13,7 @@ InferenceMonitor is a small watchdog program that sits next to your AI engine, c
 - **Sheds load without restarting** — under pressure it automatically shortens answers and trims stale conversation history, so the engine does less work per request and drains the backlog.
 - **Restarts itself as a last resort** — only if you explicitly allow it, it can restart its own deployment when gentler measures aren't enough.
 - **Explains itself out loud** — every decision is narrated in one plain-English sentence by the AI model itself, shown in the live dashboard log.
-- **Simulates traffic surges** — the dashboard has Low / Medium / High demand buttons (or a full sequence that runs all three back-to-back). Pick one, watch the governor react in real time, and get an automatic report card when it finishes: peak memory, peak queue, how many times pressure tripped, and concrete suggestions for next time.
+- **Simulates traffic surges** — the dashboard has Low / Medium / High demand buttons (or a full sequence that runs all three back-to-back). Pick one, watch the monitor react in real time, and get an automatic report card when it finishes: peak memory, peak queue, how many times pressure tripped, and concrete suggestions for next time.
 - **Tests a real cost saver** — the bundled Prefix-Cache Pilot measures whether rewording prompts (putting the repeated document before the question) makes first answers arrive faster by reusing cached computation instead of redoing it.
 
 ## The one design rule that matters
@@ -24,7 +24,7 @@ The AI model never makes operational decisions. Boring, predictable Python code 
 
 - **Python 3** — the whole app. The dashboard is plain HTML and JavaScript served directly by the program; no web framework.
 - **vLLM** — the open-source engine that actually runs the AI model and serves answers.
-- **Qwen3-4B** — the open AI model used both for answering users and for narrating the governor's decisions.
+- **Qwen3-4B** — the open AI model used both for answering users and for narrating the monitor's decisions.
 - **Kubernetes** — where the engine lives; the watchdog talks to it when the restart option is enabled.
 - **requests** — the single outside Python library, used for plain HTTP calls.
 
@@ -49,9 +49,9 @@ python3 -m py_compile governor.py cachepilot.py loadgen.py && echo SYNTAX-OK
 python3 governor.py
 ```
 
-Open http://localhost:8081 for the dashboard. Press **High demand**, watch the state flip to PRESSURE and the governor narrate itself, then read the report card when the simulation ends.
+Open http://localhost:8081 for the dashboard. Press **High demand**, watch the state flip to PRESSURE and the monitor narrate itself, then read the report card when the simulation ends.
 
-To let the governor restart its own engine as a last resort:
+To let the monitor restart its own engine as a last resort:
 
 ```
 python3 governor.py --allow-restart

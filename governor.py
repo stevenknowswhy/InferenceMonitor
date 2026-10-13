@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Autopilot Governor -- an agent that owns its inference.
+"""Inference Health Monitor -- an agent that owns its inference.
 
 Sidecar control loop for a self-hosted vLLM engine:
   1. Scrapes /metrics (auto-discovers metric names across vLLM versions).
@@ -308,7 +308,7 @@ def assess_health(snap, state, terse, previous, exit_streak):
 
 
 # ----------------------------------------------------------------------------
-# Governor: deterministic state machine (the model never decides -- it narrates)
+# Monitor: deterministic state machine (the model never decides -- it narrates)
 # ----------------------------------------------------------------------------
 class Governor:
     def __init__(self, allow_restart=False):
@@ -389,7 +389,7 @@ class Governor:
             self.activity = self.activity[-40:]
 
     def narrate(self, trigger, action):
-        prompt = ("You are the Autopilot Governor, an agent that owns its inference engine. "
+        prompt = ("You are the Inference Health Monitor, an agent that owns its inference engine. "
                   f"In ONE sentence for a live demo audience, explain this: {trigger} "
                   f"So you decided: {action}. Be concrete and confident.")
         try:
@@ -636,7 +636,7 @@ def _flood_hit(gov, prompt, n, max_tokens):
         resp = requests.post(
             base + "/v1/chat/completions",
             timeout=180,
-            headers={"X-Governor-Flood": "1"},
+            headers={"X-Monitor-Flood": "1"},
             stream=True,
             json={
                 "model": MODEL,
@@ -723,7 +723,7 @@ def flood_worker(gov, workers, max_tokens, duration):
 
             threading.Thread(target=run, daemon=True).start()
 
-    route = "governor proxy" if gov.governed else "engine directly"
+    route = "monitor proxy" if gov.governed else "engine directly"
     gov._activity(f"keeping {workers} requests in flight via the {route}")
     refill()
     while gov.flood_on and time.time() < deadline:
@@ -768,7 +768,7 @@ def build_flood_summary(gov, quiet=False):
     avg_ttft = _mean(fs.get("ttft_samples") or [])
     avg_queue = _mean(fs.get("queue_samples") or [])
     sugg = []
-    routed = "through the governor proxy" if fs.get("governed") else "direct to the engine"
+    routed = "through the monitor proxy" if fs.get("governed") else "direct to the engine"
     if fs["pressure_entries"] == 0:
         sugg.append(
             f"PRESSURE never triggered on '{fs['preset']}' demand "
@@ -776,7 +776,7 @@ def build_flood_summary(gov, quiet=False):
             "High demand is the preset sized past this engine's 32 in-flight slots.")
     else:
         sugg.append(
-            f"Governor entered PRESSURE {fs['pressure_entries']}x for ~{fs['pressure_seconds']}s "
+            f"Monitor entered PRESSURE {fs['pressure_entries']}x for ~{fs['pressure_seconds']}s "
             f"and engaged terse mode {fs['terse_activations']}x. Peak KV {fs['peak_kv']:.0f}%, "
             f"queue {round(fs['peak_queue'])}. Route: {routed}.")
         if fs["peak_kv"] >= 95:
@@ -859,13 +859,13 @@ def sequence_worker(gov):
             " ".join(f"{r['preset']}: peak KV {r['peak_kv']}%, "
                        f"{r['pressure_entries']} pressure entries, "
                        f"{r['requests']} requests" for r in runs) + ". " +
-            "The governor engaged terse mode automatically as pressure rose.")
+            "The monitor engaged terse mode automatically as pressure rose.")
         if say:
             gov.last_sequence["narration"] = say
 
 
 def compare_worker(gov, preset):
-    """Same preset, governor off then on, so the report is a measured A/B."""
+    """Same preset, monitor off then on, so the report is a measured A/B."""
     prev = gov.governed
     gov.compare_running = True
     gov.sequence_abort = False
@@ -881,11 +881,11 @@ def compare_worker(gov, preset):
             gov.flood_preset = preset
             gov.flood_stats = fresh_stats(preset, workers, mtok, dur, governed)
             gov.flood_on = True
-            gov._activity(f"compare: governor {label}, {preset} demand, {dur}s")
+            gov._activity(f"compare: monitor {label}, {preset} demand, {dur}s")
             flood_worker(gov, workers, mtok, dur)
             summary, _sugg = build_flood_summary(gov, quiet=True)
             if summary:
-                summary["label"] = f"governor {label}"
+                summary["label"] = f"monitor {label}"
                 sides.append(summary)
             time.sleep(2)
     finally:
@@ -898,7 +898,7 @@ def compare_worker(gov, preset):
         off, on = sides
         bits = []
         if on["peak_queue"] != off["peak_queue"]:
-            bits.append(f"Peak queue {off['peak_queue']} with the governor off, {on['peak_queue']} with it on.")
+            bits.append(f"Peak queue {off['peak_queue']} with the monitor off, {on['peak_queue']} with it on.")
         if (isinstance(off.get("avg_latency"), (int, float))
                 and isinstance(on.get("avg_latency"), (int, float))):
             bits.append(f"Average response {off['avg_latency']}s off, {on['avg_latency']}s on.")
@@ -910,7 +910,7 @@ def compare_worker(gov, preset):
     gov._activity("compare complete -- see Flood report")
     if verdict:
         def narrate():
-            say = gov.narrate("governor off versus on", verdict)
+            say = gov.narrate("monitor off versus on", verdict)
             if say and gov.last_compare:
                 gov.last_compare["narration"] = say
         threading.Thread(target=narrate, daemon=True).start()
@@ -920,7 +920,7 @@ def compare_worker(gov, preset):
 # Dashboard
 # ----------------------------------------------------------------------------
 DASH_HTML = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Autopilot Governor</title>
+<html><head><meta charset="utf-8"><title>Inference Health Monitor</title>
 <style>
 body{font-family:-apple-system,Helvetica,Arial,sans-serif;background:#0f1419;color:#e6e6e6;margin:0;padding:20px}
 h1{font-size:20px;margin:0 0 12px}
@@ -992,7 +992,7 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
 @media (max-width:700px){.hbar{grid-template-columns:64px 1fr}.ht{grid-column:2}}
 </style></head>
 <body>
-<h1>Autopilot Governor <span id="state" class="badge NORMAL">...</span></h1>
+<h1>Inference Health Monitor <span id="state" class="badge NORMAL">...</span></h1>
 <div class="health-head"><span class="live-dot"></span><h2>Service health, live</h2></div>
 <div class="modes" id="modes">
  <div class="mode safe" data-level="safe"><div class="k">STEP 1</div><div class="n">Safe</div><div class="s">Full answers</div></div>
@@ -1024,7 +1024,7 @@ pre{background:#0a0e14;padding:12px;border-radius:8px;white-space:pre-wrap;font-
  <button class="pill" data-preset="medium" onclick="startFlood('medium')">Medium demand <span class="muted">45s</span></button>
  <button class="pill" data-preset="high" onclick="startFlood('high')">High demand <span class="muted">40s</span></button>
  <button class="pill stop" onclick="stopFlood()">Stop</button>
- <button class="pill live" id="govtoggle" onclick="toggleGoverned()">Governor on</button>
+ <button class="pill live" id="govtoggle" onclick="toggleGoverned()">Monitor on</button>
  <button class="pill" onclick="startCompare()">A/B compare <span class="muted">20s × 2</span></button>
  <button class="pill" onclick="startSequence()">&#9654; Full sequence <span class="muted">~2 min</span></button>
  <button class="pill" onclick="cachepilot()">Run CachePilot</button>
@@ -1098,7 +1098,7 @@ async function refresh(){
     document.getElementById('hitrate').textContent = L.prefix_hit_rate==null?'-':(L.prefix_hit_rate*100).toFixed(1)+'%';
     document.getElementById('bound').textContent = L.bottleneck || '-';
     const govb = document.getElementById('govtoggle');
-    govb.textContent = s.governed ? 'Governor on' : 'Governor off';
+    govb.textContent = s.governed ? 'Monitor on' : 'Monitor off';
     govb.classList.toggle('live', !!s.governed);
     document.getElementById('mstate').textContent = s.metrics_ok ? '' : ('metrics error: '+(s.metrics_error||''));
     document.getElementById('log').innerHTML = (s.log||[]).slice().reverse().map(e=>
@@ -1119,7 +1119,7 @@ async function refresh(){
         Math.min(100, fp.elapsed / fp.total * 100) + '%';
       const flabel = s.compare_running ? 'A/B compare'
                    : s.sequence_running ? ('sequence \u00b7 ' + (s.sequence_step || '') + ' demand')
-                   : ((s.flood_preset || '') + ' demand' + (s.governed ? ' \u00b7 governor on' : ' \u00b7 direct'));
+                   : ((s.flood_preset || '') + ' demand' + (s.governed ? ' \u00b7 monitor on' : ' \u00b7 direct'));
       document.getElementById('floodtime').textContent = flabel + ': ' + fp.remaining + 's remaining';
     } else {
       fprog.style.display = 'none';
@@ -1139,9 +1139,9 @@ async function refresh(){
         +'<div class="muted">'+esc(lib.summary||'')+'</div>';
     }
     if (cmp && cmp.sides && cmp.sides.length && !s.compare_running){
-      const rows = cmp.sides.map(x=>'<tr><td><b>'+(x.governed?'governor on':'governor off')+'</b></td><td>'+x.requests+'</td><td>'+x.errors+'</td><td>'+x.peak_queue+'</td><td>'+x.peak_kv+'%</td><td>'+x.avg_latency+'</td><td>'+x.avg_ttft+'</td><td>'+x.pressure_entries+'</td></tr>').join('');
+      const rows = cmp.sides.map(x=>'<tr><td><b>'+(x.governed?'monitor on':'monitor off')+'</b></td><td>'+x.requests+'</td><td>'+x.errors+'</td><td>'+x.peak_queue+'</td><td>'+x.peak_kv+'%</td><td>'+x.avg_latency+'</td><td>'+x.avg_ttft+'</td><td>'+x.pressure_entries+'</td></tr>').join('');
       rdiv.innerHTML =
-        '<div><b>Same '+esc(cmp.preset)+' demand, governor off then on</b></div>'
+        '<div><b>Same '+esc(cmp.preset)+' demand, monitor off then on</b></div>'
         +'<table><tr><th>route</th><th>ok</th><th>errors</th><th>peak queue</th><th>peak KV</th><th>avg s</th><th>TTFT</th><th>PRESSURE</th></tr>'+rows+'</table>'
         +(cmp.verdict?'<div>'+esc(cmp.verdict)+'</div>':'')
         +(cmp.narration?'<div><span class="say">&ldquo;'+esc(cmp.narration)+'&rdquo;</span></div>':'');
@@ -1150,12 +1150,12 @@ async function refresh(){
       rdiv.innerHTML =
         '<div><b>Full sequence complete: low &rarr; medium &rarr; high</b></div>'
         +'<table><tr><th>demand</th><th>requests</th><th>peak KV</th><th>peak queue</th><th>PRESSURE</th><th>terse</th></tr>'+rows+'</table>'
-        +'<div class="muted">Read it left to right: the engine under rising load, and where the governor stepped in.</div>'
+        +'<div class="muted">Read it left to right: the engine under rising load, and where the monitor stepped in.</div>'
         +(seq.narration?'<div><span class="say">&ldquo;'+esc(seq.narration)+'&rdquo;</span></div>':'');
     } else if (rep && rep.preset){
       rdiv.innerHTML =
         '<div><b>'+esc(rep.preset)+' demand</b> &mdash; '+rep.requests+' ok, '+rep.errors+' errors, '+rep.waves+' launched in '+rep.duration_s+'s'
-        +' &middot; '+(rep.governed?'governor on':'direct')+'</div>'
+        +' &middot; '+(rep.governed?'monitor on':'direct')+'</div>'
         +'<div>peak KV <b>'+rep.peak_kv+'%</b> &middot; peak queue <b>'+rep.peak_queue+'</b> &middot; peak running <b>'+rep.peak_running+'</b> &middot; avg response <b>'+rep.avg_latency+'</b>s &middot; TTFT <b>'+rep.avg_ttft+'</b>s &middot; queue time <b>'+rep.avg_queue+'</b>s</div>'
         +'<div>PRESSURE entries: <b>'+rep.pressure_entries+'</b> (~'+Math.round(rep.pressure_seconds)+'s) &middot; terse activations: <b>'+rep.terse_activations+'</b></div>'
         +'<ul>'+rep.suggestions.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'
@@ -1264,7 +1264,7 @@ class DashHandler(BaseHTTPRequestHandler):
             else:
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 g.governed = qs.get("on", ["1"])[0] != "0"
-                g._activity("governor routing " + ("on" if g.governed else "off"))
+                g._activity("monitor routing " + ("on" if g.governed else "off"))
                 self._send(b'{"ok":true}', "application/json")
         elif self.path.startswith("/api/compare/start"):
             if not g.compare_running and not g.flood_on and not g.sequence_running:
@@ -1334,7 +1334,7 @@ def librarian_compact(gov, msgs):
         summary = ""
     facts, kept = retained_facts(older_text, summary)
     if not summary:
-        summary = "[governor compacted older history; the summary call did not return]"
+        summary = "[monitor compacted older history; the summary call did not return]"
         kept = 0
     event = {
         "t": datetime.now().strftime("%H:%M:%S"),
@@ -1346,7 +1346,7 @@ def librarian_compact(gov, msgs):
         "kv_after": None,
         "summary": summary[:400],
     }
-    note = {"role": "system", "content": "[governor memory] " + summary}
+    note = {"role": "system", "content": "[monitor memory] " + summary}
     return head + [note] + recent, event
 
 
@@ -1365,7 +1365,7 @@ def apply_terse(gov, body):
         with gov.lock:
             gov.last_compaction = event
     sys_msg = {"role": "system",
-               "content": "[GOVERNOR TERSE MODE] Answer in 3 sentences or fewer. Be direct."}
+               "content": "[MONITOR TERSE MODE] Answer in 3 sentences or fewer. Be direct."}
     body["messages"] = [sys_msg] + msgs
     return body
 
@@ -1398,7 +1398,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except Exception:
             body = {}
-        is_flood = self.headers.get("X-Governor-Flood") == "1"
+        is_flood = self.headers.get("X-Monitor-Flood") == "1"
         with self.gov.lock:
             terse = self.gov.policy.get("terse")
         if method == "POST" and terse and isinstance(body, dict):
@@ -1551,7 +1551,7 @@ def gpu_poll_loop(gov):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Autopilot Governor")
+    ap = argparse.ArgumentParser(description="Inference Health Monitor")
     ap.add_argument("--dashboard-port", type=int, default=8081)
     ap.add_argument("--proxy-port", type=int, default=8082)
     ap.add_argument("--allow-restart", action="store_true",
@@ -1578,7 +1578,7 @@ def main():
             gov.tick()
             time.sleep(POLL_SECS)
     except KeyboardInterrupt:
-        print("\ngovernor stopped")
+        print("\nmonitor stopped")
 
 
 if __name__ == "__main__":
